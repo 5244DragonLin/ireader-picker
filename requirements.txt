@@ -1,0 +1,2 @@
+# 仅密码登录（picker.py login）需要；其余所有命令为纯标准库
+cryptography>=41.0.0

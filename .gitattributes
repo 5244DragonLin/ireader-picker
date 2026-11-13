@@ -1,0 +1,2 @@
+# 保持 LF 行尾，避免 LICENSE 等文件被转换
+* text=auto eol=lf

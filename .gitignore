@@ -1,0 +1,44 @@
+# Agent Skill 类开源仓库通用 .gitignore
+
+# ===== 凭据与登录态（红线，一个都不能进仓库）=====
+config.json
+cookie.txt
+cookie.txt*
+*.cookie
+cookies.json
+.token
+token.txt
+credentials*.json
+.state/
+.secrets/
+
+# ===== 本地工具目录与过程归档（含真实账号 / 消费记录，不进仓库）=====
+.workbuddy/
+archive/
+
+# ===== 运行产物 =====
+output/
+logs/
+*.log
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ===== Node（含前端资源的技能用）=====
+node_modules/
+dist/
+
+# ===== 浏览器自动化调试产物 =====
+debug/
+*.png.tmp
+
+# ===== IDE / 系统 =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
