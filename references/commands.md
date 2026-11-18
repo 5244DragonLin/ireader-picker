@@ -113,6 +113,31 @@ python scripts/picker.py afford --full --limit 300     # 穷举全部分类（�
 
 券额小时 `afford` 返回 0 本是正常结果，不是故障。书城几乎没有几阅饼的书，等福利中心签到达标或攒够券再买。
 
+### taoshu（淘书市当期书目 × 叠加满减券推荐）
+
+```bash
+python scripts/picker.py taoshu                  # 自动找当期活动 → 叠券推荐
+python scripts/picker.py taoshu --show-coupons    # 只列当期券（面额/门槛/有效期）
+python scripts/picker.py taoshu --limit 1200      # 自付上限显式指定
+python scripts/picker.py taoshu --act <act_id>    # 指定活动页（多期同挂时）
+```
+
+「淘书市」是 App 书城出版/精选频道页顶部滚动 banner 里的运营活动（约一月换两次期），每期活动页挂 3~4 张满减券（如「满2000减800」）加约 150 本活动书目。本命令读活动页（协议与 `ireader_welfare` 的领券同源，见 `api.md` 13 节），回答的问题是：**叠加当期淘书市券 + 我账上的代金券，现在就能 0 元拿下哪些书**。
+
+逻辑（与 `afford --coupon` 同口径，只是候选池换成当期活动书目）：
+
+1. 自动找当期活动（banner 名称带「淘书」→ 活动页正文确认 → 有券组件兜底）；未换期时安静退出，不是错误。
+2. 选券：门槛 ≤「自付上限 + 面额」里取面额最大的那张；够不上门槛则不启用并说明差多少。总价上限 = 自付上限 + 面额。
+3. 活动书目逐本查价（匿名可查；有凭证时排除已拥有），留「未拥有 且 价 ≤ 总价上限 且 券后自付 ≤ 上限」的书，按自付价格升序。
+4. 每本标注 `券后自付`（满 X 减 Y）；`coupon_used=false` 的书本身价格就在自付上限内，券是余量。
+
+注意：
+
+- **领券不归本命令管**：`taoshu` 只读不领。券要用 `ireader_welfare`（`python src/main.py taoshushi`）领到账户里，`buy` 下单时满减券自动抵扣。
+- 券后价按标价估算；满减券门槛比的是活动价（`dis_price`），实际以 `buy` / `info` 试算为准。
+- 未换期（滚动栏里没有 opr 活动链接）返回 0 本属正常。
+- 输出字段里的 `source` 说明活动是靠哪级判定找到的（banner 名称 / 活动页正文 / 券组件兜底）。
+
 ### recommend / category / categories
 
 ```bash
@@ -255,6 +280,102 @@ python scripts/picker.py recommend --douban --douban-top 30  # 限 30 本
 
 看到这类提醒时，豆瓣分只能当参考，不能当这一版的准确评分。完整接口与降级策略见 `douban.md`。
 
+### 作者主页 `author`
+
+按作者的任一作品查作者主页，得到作者简介与名下全部作品（带价）。数据源是掌阅作者主页：书籍详情页作者区带 `data-js="author-page"` 与作者 id（`data-un`），指向 `/zyuc/homepage/`；调用链是「书籍页拿作者 id → 主页拿简介与作品数 → 全部作品分页」。App 搜索顶部那张作者卡片是另一个数据源，脚本走的移动版搜索页不含它；本命令在功能上覆盖作者卡的核心用途——确认作者是谁、看名下全部书。
+
+```bash
+python scripts/picker.py author 11692139    # 入口书：沙海① → 南派三叔全部 11 本（带价）
+python scripts/picker.py author 11692139 --json
+```
+
+- 名下作品由作者主页「全部作品」分页取全（每页 10 条，第 2 页起返回 JSON），比按作者名搜索更全：搜索漏掉的挂名书（合著、工作室署名、[译]挂名）都在这里。
+- 入口书有多个署名（[著]/[译]/多人）时默认取[著]作者，`--json` 的 `roles` 字段是全部署名与各自作者 id。
+- 名下作品不区分出版/网文；判断出版与否看单本 `info` 的出版社/ISBN。
+- 按作者名搜书会被同名作者与书名含关键词的书淹没（人名兼地名的尤其严重，如「江南」），正确入口是：先 `search` 找到该作者任一本书，再用 `author <book_id>` 看名下全部作品。同名作者一眼可辨——各看一个作者主页的简介即可。
+- 无作者主页的书（多为无署名条目）会明确报错退出；作者主页作品数与「全部 N 本」标注不一致时以实际条目为准。
+
+### 书单搜索与书单详情 `blsearch` / `booklist`
+
+搜索结果页「书单」页签的数据：用户创建的书单（书单 id/名/描述/标签/收藏数/含书数），数据源是 `/zybook3/u/p/api.php?Act=searchMultiple&keyWord=...`（App 搜索多栏接口，同一响应里还有作者卡与书籍条目）。翻页参数见 `api.md` 11.7 节：带 `type=bkList&pageSize=<n>&currentPage=<m>` 即是 App「加载更多」请求，可一直翻到 totalRecord 为止。
+
+`booklist` 优先走原生接口 `/zyus/booklist/info`（每页 10 本、自动翻页取全书目），拿不到时退回 H5 详情页（每页 5 本、只有第一屏）。
+
+```bash
+python scripts/picker.py blsearch 南派三叔        # 首屏书单 + 作者卡 + 同页书籍 + 相关搜索
+python scripts/picker.py blsearch 南派三叔 --page 2   # 书单第 2 页（每页 20 个，只返回书单）
+python scripts/picker.py blsearch 南派三叔 --all      # 自动翻页拿全部书单（每页 50，上限 200）
+python scripts/picker.py blsearch 南派三叔 --json
+python scripts/picker.py booklist 129684          # 书单详情（含书/收藏/标签 + 全书目 + 推荐理由）
+python scripts/picker.py booklist 129684 --sale   # 只看在售书（剔除下架书）
+python scripts/picker.py booklist 129684 --json
+```
+
+- `blsearch` 三种模式：默认 = App 首屏（3 个书单 + 作者卡 + 同页书籍 + 相关搜索）；`--page N` = 原生「加载更多」（每页 20 个，**只返回书单**，作者卡/同页书籍/相关搜索不返回，接口本身如此）；`--all` = 自动翻页聚合去重（每页 50 个，上限 200 条防跑飞，`fetched`/`total` 字段标明抓了多少/共有多少）。
+- 超界页码不报错，返回空列表；`bk_page.currentPage` 会被服务端钳制为最后实际页，翻页循环以它为准推进。
+- **书单书目普遍含下架书**（实测比例 30%~67%）：原生接口条目 `is_removed=true` 即下架，这类书 `info` 查不到详情与价格、无法购买。人读输出会打 `[已下架]` 标并在头部汇总下架数；`--sale` 只显示在售书（H5 回退路径无此字段，加 `--sale` 会提示未生效）。`readable` 全为 true，不是在售判据。
+- **推荐纪律**：给用户推荐书单里的书时默认用 `--sale` 的结果，不得把下架书混进推荐清单；全书目展示时保留 `[已下架]` 标记（见 SKILL.md「简介的呈现纪律」第 7 条）。
+- `booklist` 原生接口一次能取全书目（`count` 为准），字段含 `bookRating`/`book_desc`（推荐理由）/`readable`/`is_removed`；H5 回退路径每页 5 本、只能取第一屏。
+- 书单详情里「推荐理由」是创建人手写文案（原生接口的 `book_desc`），向用户呈现时按 SKILL.md「简介的呈现纪律」整理；`description` 才是书籍内容简介，两者别混。
+- 同名作者场景（如「江南」）：blsearch 会把作者卡（data_type=1，含简介与 usr）与书籍条目分列输出，结合 `author <book_id>` 的作者主页简介即可判定是否本人。
+
+### 书城搜书 `bsearch`
+
+App 搜索结果页「书籍」页签的数据（searchMultiple 的 `type=book&filterAuthor=1` 模式，逆向 `ih/b.n`）：书 id/名/作者/评分/分类/完结状态。与 `search` 的分工：`search` 走 H5 页（m.zhangyue.com），结果接 `info`/`buy` 选书比价流程；`bsearch` 走 App 接口、带评分/分类元数据但不查价，适合「这个作者/题材都有什么」的发现式查询。
+
+```bash
+python scripts/picker.py bsearch 南派三叔        # 书籍列表（每页 20 本，带评分/分类/完结状态）
+python scripts/picker.py bsearch 南派三叔 --page 2
+python scripts/picker.py bsearch 东野圭吾 --all      # 自动翻页拿全部（每页 50 本，上限 200）
+python scripts/picker.py bsearch 东野圭吾 --json
+```
+
+- `completeState` 是 `Y`/`N` 字符串（已完结/连载中），人读输出已转成中文；`bookRating` 为 0 表示无评分。
+- `filterAuthor=1` 会滤掉作者卡条目（data_type=1）；要作者卡用 `blsearch` 默认模式或 `author` 命令。
+- 翻页超界不报错，返回空列表并提示；`--all` 以响应里的 `currentPage` 推进，上限 200 条防跑飞。
+
+### 我的书单 `mybl` / `blnew` / `bledit` / `bladd` / `blrm` / `bldel` / `blfav` / `blsuggest`
+
+对应 App「我的 - 我的书单」。查询类（`mybl` / `blsuggest` / `booklist`）只读；其余是写操作，`blrm` / `bldel` 默认只预览，加 `--yes` 才落地。
+
+```bash
+# 看
+python scripts/picker.py mybl                     # 我创建的书单
+python scripts/picker.py mybl --books             # 连每个书单里的书一起列
+python scripts/picker.py mybl --fav               # 我收藏的书单
+python scripts/picker.py blsuggest 三体            # 联想：在售 book_id 与 ISBN 条目
+
+# 建 / 改
+python scripts/picker.py blnew "硬科幻入门" --desc "从刘慈欣到莱姆，十本够读一年"
+python scripts/picker.py blnew "求推荐科幻" --desc "想找冷门但好看的" --qiu
+python scripts/picker.py blnew "硬科幻入门" --desc "…" --add 10881716:短篇最见功力
+python scripts/picker.py bledit 42379591 --name "硬科幻入门（修订）"
+python scripts/picker.py bledit 42379591 --desc "换一句更短的描述"
+
+# 加 / 减
+python scripts/picker.py bladd 42379591 10881716 11550952 --dry     # 先预览
+python scripts/picker.py bladd 42379591 10881716 11550952 --reason "都值得读"
+python scripts/picker.py bladd 42379591 ISBN:9787229042066          # 加豆瓣 ISBN 书
+python scripts/picker.py blrm 42379591 11550952                     # 预览
+python scripts/picker.py blrm 42379591 11550952 --yes
+python scripts/picker.py bldel 42379591                             # 预览
+python scripts/picker.py bldel 42379591 --yes
+
+# 收藏别人的
+python scripts/picker.py blfav 3264827
+python scripts/picker.py blfav 3264827 --off
+```
+
+- `blnew` 的 `--desc` 必填（服务端也要求 1~200 字）；名称 1~40 字。超长或命中敏感词统一返回 `31215`，脚本已在本地先挡超长。
+- `blnew --add` 内部是「先建空单 → 逐本加」，因为服务端 `addBooks` 参数解析不过（见 `api.md` 11 节）。单次上限 100 本。
+- `bladd` 的书名/作者/封面优先从书籍详情页取，取不到（下架书/仅试读）退回联想接口；两处都拿不到时会用空书名加进去，加完再回读书单补书名。
+- `bladd` 加已存在的书返回 `31206 该图书已存在`，不是错误，脚本按「未加入」列出并以退出码 1 结束（若有其它书成功则仍为 0）。
+- `blrm` 会先核对书单里确实有这本书，不在的直接跳过并提示；`bldel` 会先读书单名做确认清单。删除书单**不影响**书本身，也不动书架。
+- `blfav` 是收藏「别人的书单」；收藏后出现在 `mybl --fav`，`favorite_time` 为收藏日期。
+- `bledit` 只改传了的那一项；**保存后书单会进入审核态**（`mybl` 里 `status=check`，此时 `booklist` 的 `info` 会报 `53002`，约 1~2 分钟恢复），且自动生成的标签会被清空（重新加书才会重算）。只改传了的那一项，不要顺手改描述。
+- `booklist` 遇到审核态时会在 stderr 提示「多为审核中，稍后重试」，并退回 H5 页（可能只有第一屏）。
+- `--json` 全部支持，字段与原生接口一一对应（见 `api.md` 11 节）。
+
 ## 4. 写操作命令
 
 ### buy
@@ -267,6 +388,7 @@ python scripts/picker.py buy 10007034 --confirm                # 真实下单，
 python scripts/picker.py buy 10007034 --confirm --max-voucher 100   # 限额保护
 python scripts/picker.py buy 10007034 --confirm --no-shelf     # 下单但先不加书架
 python scripts/picker.py buy 10007034 --confirm --folder 外国经典文学   # 买完直接归夹
+python scripts/picker.py buy 10007034 --confirm --no-auto-folder        # 买完不自动归夹
 python scripts/picker.py buy 10007034 --ignore-coupon          # 不使用满减券，按活动价原价买
 ```
 
@@ -274,7 +396,8 @@ python scripts/picker.py buy 10007034 --ignore-coupon          # 不使用满减
 - 已拥有的书会直接拦住，不会重复购买。
 - **自动使用满减券**：走新版订单通道，达到门槛的满减券直接抵扣，无需手动勾选。
 - 余额不足（代金券 + 阅饼 < 折后应付）时会拦住，并说明还差多少。
-- 下单成功后自动调用加书架（掌阅「购买」与「加书架」是两步）。
+- 下单成功后自动调用加书架（掌阅「购买」与「加书架」是两步），并按「买完自动归夹」的判定归入合适的自建文件夹；判断不明确则保持未归类。
+- 询价输出末行「买完归夹」会提前写明归到哪里及依据，`--confirm` 成功后按该决定一次写入。
 - 这套下单流程已实测买下过书，完整接口细节见 `api.md` 第 9b 节。
 
 **询价输出示例**（《深宅活寡》实测）：
@@ -385,6 +508,21 @@ python scripts/picker.py rmdir 待读 --dry     # 预览
 
 `buy` 和 `shelf` 都支持 `--folder`。买书成功后自动加书架的那一步会直接带上 `folder_hierarchy`，等于「加书架 + 移书」一次做完，不用再补一次 `move`。夹不存在会自动建。
 
+### 买完自动归夹
+
+不带 `--folder` 时，`buy` 询价会多打印一行「买完归夹」，写明将归入哪个文件夹及依据；`--confirm` 成功后按这个决定直接把书加进该文件夹（`shelf_add` 的 `folder` 参数，一次写入，不用再调 `move`）。
+
+候选只取书架里已存在节点的自建文件夹（`shelves` 输出中 `id` 非空），不新建文件夹。按下列信号取最高分：
+
+| 分数 | 信号 |
+|------|------|
+| 100 | 文件夹名出现在书名中，或文件夹名与作者相同 |
+| 80 | 该文件夹里已有 ≥2 本书与目标书共享系列前缀（书名按 `·`、空格、`：` 等切出的第一段） |
+
+最高分须 ≥80 且领先第二名 ≥20 分才归夹；分数并列、没有候选、或读取书架/书目失败，一律保持未归类。「已阅」「本地导入」「待读」这类状态/评价类文件夹不作为候选。显式 `--folder` 优先于自动判定，`--no-auto-folder` 或 `--no-shelf` 可关闭这一步。
+
+脚本只做确定性匹配，不理解题材语义。若判定「不移动」，而依据 `shelves --books` 与书目信息能确认有明确更合适的文件夹，可先 `move <book_id> --to <夹名> --dry` 预览、再去掉 `--dry` 补移；没有把握不要移动。
+
 ### 书架写入的实测结论
 
 | 事项 | 结论 |
@@ -396,6 +534,31 @@ python scripts/picker.py rmdir 待读 --dry     # 预览
 | 已有夹的 `id` | 不必关心，移动只用名字；`shelves` 里 `id` 为空说明该夹只是书上挂的名字、没有独立节点（不该出现，除非手工写坏） |
 
 移动是纯归类调整，不涉及钱、不改变已购状态，但仍是写操作：批量整理前先跑一次 `--dry` 看清单。
+
+### 购物车：`cart` / `cartdel` / `cartadd`
+
+掌阅 App 书城里有购物车（详情页右上角 🛒 图标，上限 50 本，支持出版/漫画，结算可用满减券）。购物车与书架是两套系统；购买≠加购物车，App 里加购的书记录在「新版购物车」服务里。
+
+```
+python picker.py cart                # 购物车列表：分组 + 每本价格 + 「下架/失效」标记（只读）
+python picker.py cart --recd         # 同时列出基于购物车的推荐书目
+python picker.py cartdel 11778693    # ⚠️ 移出购物车：默认只预览要删哪些
+python picker.py cartdel 11778693 --yes   # 确认删除；删完自动复核
+python picker.py cartadd 10867623    # ⚠️ 加入购物车（服务端目前对脚本会话返回 53002，见下）
+```
+
+`cart` 输出里每本书带 `state` 标记：`0`=正常、`1`=免费、`2`=**下架**、`3`=失效。下架/失效的书不支持结算，但留在车里不影响其他书；要清理用 `cartdel`。`☑/☐` 是结算勾选状态（App 里新加的书自动勾选）。
+
+`cartdel` 默认只预览（列出在购物车里的命中与不在的），`--yes` 才真删；删完自动重新拉列表复核并汇报剩余数量。不在购物车里的 book_id 会明确跳过，不会误删。
+
+`cartadd` 实测可用（契约逆向自 `pluginwebdiff_bookdetail`，服务端要求请求带非空 `p1`/`p3` 设备参数，脚本已内置，详见 `api.md` 10b.4 排障记录）。行为细节：
+
+- **重复加购**返回 `code=201 已加入购物车`，脚本会提示「已在购物车，无需重复添加」，不算失败。
+- `--category` 默认 `1`（出版书籍）。网文/漫画书加购时若报参数类错误，可尝试 `--category 2`（漫画）。
+- 加购与 `buy` 一样是写操作：默认对用户可见的副作用是 App 购物车页多一本书，不涉及钱。批量加购前先把 book_id 清单给用户过目。
+- 下架书（`state=2`）无法加购回购物车（服务端拒），符合官方规则「下架书籍不支持结算」。
+
+另有旧通道 `webintf/api/cartAdd`（无需签名但要求全套设备参数，写入的是旧版购物车，App 购物车页看不到，仅在 `Cart.Num` 计数可见），对用户无使用价值，脚本未实现；`cart` 输出不含旧购物车数量，两者互不相通。
 
 ## 5. 输出格式约定
 
@@ -416,6 +579,7 @@ python scripts/picker.py rmdir 待读 --dry     # 预览
 | `balance` | ~2 秒 |
 | `coupons` | ~2 秒 |
 | `category`（单分类） | ~9 秒 |
+| `taoshu`（活动解析 + 151 本查价） | ~25 秒 |
 | `recommend --top 200` | ~15 秒 |
 | `afford --top 600` | ~40 秒 |
 | `afford --full`（全 42 分类 ≈9200 本） | ~10 分钟 |
@@ -430,6 +594,8 @@ python scripts/picker.py rmdir 待读 --dry     # 预览
 我明明有「满 1000 减 200」，为什么还是显示余额不足？先看活动价够不够门槛——满减券门槛比的是活动价（`dis_price`），不是标价。若活动价已 ≥ 1000 且券后价仍在代金券额度内，`buy` 会自动用上这张券；提示余额不足说明「活动价 − 200」超过了你手上的代金券。查券用 `coupons`。
 
 为什么 `afford` 默认只扫出版频道？出版类书最可能有整本价、适合花券；男频/女频多为连载按千字计价，没有整本价。要用全频道加 `--channels 92,10,68`。
+
+`taoshu` 说「本期活动不在滚动栏里」是什么意思？淘书市约一月换两次期，运营没挂活动入口时命令拿不到当期 act_id，安静退出是正常状态，过几天再试；也可先用 `ireader_welfare` 确认当期有没有券可领。
 
 结果和 App 里看到的不一致？官网分类页与 App 的推荐位/活动位不完全同步。本工具反映官网分类页的当前快照。
 

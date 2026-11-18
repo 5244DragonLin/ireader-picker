@@ -592,7 +592,290 @@ data=[{ "book_id":"11582366", "book_name":"某某书",
 `folder_hierarchy`。实测把某本书在「外国经典文学」与「科幻」之间往返移动，
 两次都返回 `code=0`，重新 `list` 后两个夹的计数正确变化并复原。
 
-## 11. 速率与并发
+## 10b. 购物车（新版，`/zyuc/api/cart/cart`）★
+
+掌阅 App 书城的购物车（详情页右上角 🛒 图标，上限 50 本，支持出版/漫画）。**与书架、与旧版购物车（10 节之前那套 `app.php?ca=Cart.*`）互不相通**。结论均来自 APK 逆向（主 dex + `pluginwebdiff_bookdetail.apk` / `pluginwebdiff_bookstore4.apk` 两个内嵌插件）加真机实测，2026-11-14。
+
+### 10b.1 端点与签名
+
+```http
+GET https://ah2.zhangyue.com/zyuc/api/cart/cart
+    ?act=<动作>&timestamp=<毫秒时间戳>&usr=<usr>&sign=<签名>
+    &zysid=<zysid>&pluginVersion=34
+```
+
+**签名算法**（逆向自 `PluginRely.addSignParam` → `account/d.a` → `Security.hash`）：
+
+```text
+待签串 = "act=<act>&timestamp=<ts>&usr=<usr>"     ← 按 key 字典序，固定就这 3 个参数
+sign   = BASE64( SHA1withRSA(待签串) )             ← 客户端内置 RSA 私钥（native_keys.json 第 4 把）
+```
+
+铁律（全部实测验证）：
+
+- **待签串只允许 act/timestamp/usr 三个参数**。多塞 `bookId`/`zysid`/`pluginVersion` 任何一个都返回 `53001 签名错误`（见 10b.5 变体矩阵）。
+- 私钥与登录同族（`native_keys.json`，服务端只认下标 3 那把）。**购物车接口依赖 cryptography 库**。
+- 业务参数（`bookId`/`books`/`orderId` 等）与设备参数拼在 `sign` 之后、**不参与签名**；`zysid` 必须在 query（缺了返回 `50000 未登录`）。
+- `timestamp` 是毫秒。UA 版本对该接口无影响；**设备参数 `p1`/`p3` 仅 `act=add` 校验**（见 10b.4），其余动作不需要。
+
+### 10b.2 动作（act）与参数
+
+| `act` | 作用 | 附加参数 | 实测 |
+|-------|------|---------|------|
+| `list` | 购物车列表 | 无 | ✅ |
+| `add` | 加入购物车 | `&bookId=<id>&bookCategory=<1出版/2漫画>` + **必需 `&p1=…&p3=…`（见 10b.4）**；重复加返回 `code=201 已加入购物车` | ✅ |
+| `del` | 删除书目 | `&books=[{"bookId":<id>,"bookCategory":1}]`（URL 编码 JSON，来自 `DeleteBook{bookId, bookCategory}`） | ✅ |
+| `change` | 改结算勾选状态 | `&books=[{"bookId":..,"bookCategory":..,"selectStatus":0/1}]` | ✅ |
+| `recd` | 基于购物车的推荐 | 无 | ✅ |
+| `coupon` | 购物车可用券 | `&orderId=` | 未实测 |
+
+响应包装：`{"code":0,"msg":"ok","body":{...}}`。错误/状态码：`201 已加入购物车`（add 重复）、`50000 未登录`（缺 zysid）、`53000 参数错误：<字段>不能为空`、`53001 签名错误`、`53002 系统异常`。
+
+### 10b.3 列表结构（`act=list` 的 body）
+
+```json
+{
+  "books": [{
+    "type": 1, "typeName": "出版书籍", "couponInfo": {},
+    "bookList": [{
+      "bookId": 11172277, "bookName": "西洋哲学史", "author": "冯友兰",
+      "price": "599", "priceDesc": "599阅饼",
+      "state": 0, "selectStatus": 0, "buyDesc": "", "isDiscount": 1,
+      "diff": "", "voucherDesc": "", "picUrl": "…", "url": "…"
+    }]
+  }],
+  "booksLimit": 50,
+  "ruleUrl": "https://ah2.zhangyue.com/zyuc/cart/rule?…"
+}
+```
+
+- 分组 `type`：`1`=出版书籍；漫画另成组（未实测）。**加购的 `bookCategory` 与分组 `type` 同源**（出版=1）。
+- 书目 `state`（逆向自 `BookInCart` 常量 `STATE_*`）：`0`=正常、`1`=免费、`2`=**下架**、`3`=失效。**下架/失效的书不支持结算**（官方规则页明示），App 里置灰显示。实测 2 本下架书 `state=2`。
+- `selectStatus`：结算勾选状态，App 加购的书自动置 1。
+- 规则页 `ruleUrl`（`/zyuc/cart/rule`）匿名可访问，写明：单次结算上限 50 本、支持代金券及阅饼、下架/免费/不参与活动的书不支持结算。
+
+### 10b.4 加购（`act=add`）的排障全记录（已破案 ✅）
+
+契约逆向自 `pluginwebdiff_bookdetail` 的 `ui/presenter/a.a(boolean)`：
+
+```text
+URL = URL_BASE_PHP + "/zyuc/api/cart/cart?act=add"
+      + "&timestamp=<N1>&bookId=<bookId>&bookCategory=<1或0>&"
+      + getUrledParamStr({usr, timestamp, act:'add'} + addSignParam 追加的 sign)
+备用通道（布尔参数为假时）：URL_BASE_PHP + "/webintf/api/cartAdd?bid=<id>&pk=client_shopCart"
+```
+
+**最终答案**：`act=add` 的业务层要求请求携带**非空的 `p1`（设备指纹）与 `p3`（客户端版本号）**两个设备参数。值本身任意（旧版本号、任意 hex 都行，顺序无关），但缺失或为空 → 业务层异常 `53002 系统异常 body=-1`。其他动作（list/del/change/recd）不校验设备参数，这就是「只有 add 失败」的原因。
+
+```text
+最小可用形态：
+GET …/cart/cart?act=add&timestamp=<ms>&usr=<usr>&sign=<签名>
+    &bookId=<id>&bookCategory=1&zysid=<zysid>&pluginVersion=34
+    &p1=ffffffffffffffffffffffff&p3=18080103
+```
+
+排查过程（供未来类似问题参考）：
+
+| 假设 | 实验 | 结论 |
+|------|------|------|
+| bookCategory 取值不对 | 暴力扫描 223 个值（1-150 + 全部分类 cid） | 全 53002，排除 |
+| 会话类型歧视（密码登录 vs 真机） | 从模拟器 MMKV 提取 App 登录 blob（`AT@6 {"AesKey":…,"Data":…}`），用登录同款 RSA 公钥解密 + AES 还原 → **App 会话与脚本会话完全相同**（服务端按用户复用 zysid） | 排除，且证明差异在请求本身 |
+| 请求方法/体/顺序 | POST、表单体、双时间戳复刻、参数重排 | 排除 |
+| UA / Cookie / Referer | 多版本 UA、各种 Cookie、XHR 头 | 排除 |
+| 设备参数集 | 从**抓包成功流**（`saad.ms.zhangyue.net/ad/cfg` 带 App 真实全参数）提取 `p1/pc/p2/p3/p4/p5/p7/p9/p16/p21/p22/p25/p28/p29/p31/p33/p34` 全套重放 → **成功** | 锁定方向 |
+| 必需参数定位 | 二分 + 单变量：`p3` 缺失 ❌、`p1` 缺失 ❌、两者都在 ✅；`p7`（设备 ID）不需要；p1/p3 值任意（旧版本号、任意 hex、顺序无关），**空值不行** | **最小集 = 非空 p1 + p3** |
+
+附带发现：
+
+- **`code=201` = 已加入购物车**（对应 App 反编译里 `NetworkException.getmResponseCode()==201 → updateCartMenu2HasAdded`），是正常状态不是错误。
+- App 每个请求都带全套设备参数（`DeviceInfor.setURL` 构建）：`pc=10&p1=<指纹>&p2=<渠道>&p3=<版本>&p4&p5&p7=<设备ID>&p9&p16=<机型>&p21&p22=<安卓版本>&p25=<版本码>&p28&p29=zye5b814&p31=<androidId>&p33=<包名>&p34=<品牌>`。模拟器实测值：`p2=116298`、`p3=18080103`（8.8.1）、`p4=501603`、`p7=__5a10c5b990da8855`。
+- 排查中解密模拟器 MMKV 的方法有复用价值：MMKV 明文存储登录 blob，`AT@6 {"AesKey":…,"Data":…}` 用登录同款 `rsa_public_decrypt(AesKey)` + `aes_decrypt(Data)` 可还原 `session_id` 与 `device_list`——**等于免抓包拿到 App 的会话与设备信息**。
+- MITM 不可行的原因（记录备查）：App API 域流量走字节 TTNet/Cronet（`libtnet-3.1.14.so`），自带证书校验与锁定（系统 CA 对 CDN 域生效、对 ah2 被拒）；frida 注入被反调试杀进程（改名换端口也不行）。
+
+### 10b.5 旧通道（`webintf/api/cartAdd`，供参考）
+
+```http
+GET https://ah2.zhangyue.com/webintf/api/cartAdd?bid=<bookId>&pk=client_shopCart&usr=&zysid=&p29=…&p2=…&p3=…&p4=…&p33=…
+```
+
+- **必须带设备参数（p2/p3/p4/p33/p29）**，缺了直接 404（tengine 路由依赖）。无需签名。返回 `{"code":0,"msg":"ok","body":<加购后旧购物车总数>}`。
+- 写入的是**旧版购物车**（`app.php?ca=Cart.Num` 计数那套）：App 购物车页面看不到、旧购物车页 `Cart.Index` 已废弃（返回空）、不会同步进新版购物车。**对用户无使用价值。**
+- 宿主域名曾试过 `uc.ireader.com`（同路径返回 -99999 系统错误，整族 webintf 在该宿主已死）。
+
+### 10b.6 旧版购物车的残迹（已废弃，勿追）
+
+主 dex 里还有旧通道痕迹：`app.php?ca=Cart.Index&key=GW1`（购物车页，真凭证也返回空=已废弃）、`ca=Cart.Num`（数量接口，**仍可用**，返回 `{"num":N,"status":0}`）、`ca=Order_Batch.Index&from=client`（旧批量结算页，未带版本参数时跳升级页）。旧购物车与新购物车互不相通（实测：旧通道加购后新列表不变）。
+
+## 11. 书单（`/zyus/booklist/*` 原生 + `ca=Booklist.*` H5）★
+
+「我的 - 我的书单」这套功能有两条通道：**读/删/收藏走 App 原生 `/zyus/booklist/*`（要签名）**，**加书/改书单走 H5 `app.php?ca=Booklist.*`（不要签名，但要带页面参数）**。结论来自 APK 逆向（`classes6.dex` 的 `online/ui/booklist/detail/m`、`edit/a`、`ActivityMyBookList`、`lh/a`）加 2026-11-16 全量实测。
+
+### 11.1 端点与签名（★ 每个接口签的东西不一样）
+
+```http
+GET  https://ah2.zhangyue.com/zyus/booklist/myList?zysid=<zysid>&<参数>
+POST https://ah2.zhangyue.com/zyus/booklist/add?zysid=<zysid>       （参数全在 body）
+POST https://ah2.zhangyue.com/zyus/booklist/update?zysid=<zysid>
+POST https://ah2.zhangyue.com/zyus/booklist/operate?zysid=<zysid>
+POST https://ah2.zhangyue.com/zyus/booklist/book/operate?zysid=<zysid>
+GET  https://ah2.zhangyue.com/zyus/booklist/info?<参数>
+```
+
+**签名算法**与购物车同源（`PluginRely.addSignParam` → `account/d.a`）：
+
+```text
+待签串 = "<k=v 按 key 字典序>"        ← 用 & 连接，跳过空值
+sign   = BASE64( SHA1withRSA(待签串) ) ← native_keys.json 第 4 把私钥
+```
+
+但**每个接口签哪些 key 不同**，这是整套接口最容易踩的坑（多签一个或少签一个都返回 `53001 签名错误`）：
+
+| 接口 | 参与签名的 key | 备注 |
+|------|---------------|------|
+| `myList` | `timestamp` `usr` | `listType`/`start`/`size` **不签** |
+| `info` | 全部 query 参数 | `bookListId` `isEdit` `page` 都要签 |
+| `operate` | `operate` `bookListId` | 两个都要签 |
+| `book/operate` | `operate` `bookListId` `bookId` | 三个都要签 |
+| `add` | 全部 | `addBooks` 也签（但它本身解析不过，见 11.4） |
+| `update` | `bookListId` `name` `desc` | **`addBooks`/`updateBooks` 必须排除**，签了就 53001 |
+
+铁律（全部实测）：
+
+- **`zysid` 一律放 query、绝不参与签名**。缺了返回 `50000 未登录`，签进待签串则 `53001`。
+- **POST 接口的业务参数要放 body**，不是 query。`add`/`update` 把参数塞 query 会返回 `53003 参数不正确` 或 `53001`。
+- GET 接口（`myList`/`info`）参数放 query。`info` 缺 `page` 也返回 `53003`。
+- 待签串里的值**不做 URL 编码**（与购物车一致，直接拼原文）。
+- `timestamp` 是毫秒。
+
+### 11.2 接口清单
+
+| 接口 | 方法 | 参数 | 作用 | 实测 |
+|------|------|------|------|------|
+| `/zyus/booklist/myList` | GET | `listType`(1我建的/2我收藏的) `start`(页码,从1起) `size`(≤20) | 我的书单列表 | ✅ |
+| `/zyus/booklist/info` | GET | `bookListId` `isEdit`(0/1) `page`(从1起,每页10本) | 书单详情 + 书目 | ✅ |
+| `/zyus/booklist/add` | POST | `bookType`(1晒/2求) `name` `desc` `addBooks` | 建书单 | ⚠️ 见 11.4 |
+| `/zyus/booklist/update` | POST | `bookListId` `name` `desc` `addBooks` `updateBooks` | 改名/改描述 | ✅ |
+| `/zyus/booklist/operate` | POST | `operate` `bookListId` | 删单/收藏/取消收藏 | ✅ |
+| `/zyus/booklist/book/operate` | POST | `operate` `bookListId` `bookId` | 移出书单 | ✅（仅 delete） |
+
+`operate` 的取值（逆向 `ui/presenter/e` + 实测）：
+
+| `operate` | 作用 | 实测 |
+|-----------|------|------|
+| `delete` | 删除书单 | ✅ |
+| `addFavorite` | 收藏别人的书单 | ✅ |
+| `deleteFavorite` | 取消收藏 | ✅ |
+| `check` | 收藏前检查 | 未测 |
+| `like` / `dislike` | 书单点赞/踩 | 未测（在 `book/operate` 下实测返回成功但书目被清空，勿用） |
+
+`book/operate` 的 `operate`：**只有 `delete` 可用**。`add`/`del` 返回 `53002 获取数据错误`；`update`/`edit`/`modify` 同。加书只能走 H5（11.3）。
+
+### 11.3 H5 通道（加书 / 改推荐理由）
+
+```http
+POST https://ah2.zhangyue.com/zybook3/app/app.php
+     ?ca=Booklist.AddOneBook&usr=<usr>&zysid=<zysid>&p29=zye5b814&p2=104583
+     &p3=18070403&p4=501603&p33=com.chaozh.iReaderFree
+body: id=<书单id>&bid=<book_id 或 ISBN:xxx>&type=<1在售/0 ISBN>&name=&author=&pic=&desc=&timestamp=
+```
+
+- **不要签名**，但要带全 5 个页面参数（`p29`/`p2`/`p3`/`p4`/`p33`），缺了返回 `1 参数不正确`。
+- `desc` 就是「推荐理由」，`name`/`author`/`pic` 会被服务端覆盖成真实书目信息，传空也可以。
+- 重复加同一本书返回 `31206 该图书已存在`（不是 upsert）。
+- `Booklist.DeleteBook` 用 `id`+`bid`+`user_name`（**不是** `bklist_id`，那个会报 `'user_name'` KeyError）。
+- `Booklist.UpdateOneBook`（改推荐理由）实测恒返回 `1 无数据返回`，**不可用**；要改理由只能删了重加。
+- `Booklist.Suggest`（加书联想）是 GET，参数 `ca=Booklist.Suggest&keyword=<词>&id=<书单id>`，返回 `[{id,type,name,author,pic}]`；`type=1` 在售（`id` 是数字 book_id）、`type=0` 豆瓣 ISBN（`id` 形如 `ISBN:9787...`）。
+
+### 11.4 建书单：`addBooks` 是坏的，必须分两步
+
+`/zyus/booklist/add` 的 `addBooks` **无论传什么结构都报** `code=2 invalid literal for int() with base 10: ''`——服务端拿书单 id（新建时为空）去做 `int()` 转换。试过的全部结构均失败：
+
+```text
+[]                                 → 成功（唯一能过的值）
+[{"bookId":"10881716"}]            → invalid literal for int()
+[{"n":"10881716","o":"理由"}]      → invalid literal for int()   ← lh/a 的字段名也不行
+[{"id":10881716,"name":"x",...}]   → invalid literal for int()
+["10881716"]                       → 'str' object does not support item assignment
+```
+
+逆向出的结构确实是 `[{"n":"<bookId>","o":"<推荐理由>"}]`（`edit/a.g5` 把 `jh/b.o`→`lh/a.n`、`jh/b.r`→`lh/a.o`，`lh/a` 只有 `n`/`o` 两个字段），但服务端这条链路已坏。**正确做法：先建空单（`addBooks=[]`），再逐本 `Booklist.AddOneBook`**。脚本 `blnew --add` 就是这么实现的。
+
+### 11.5 字段与限制
+
+`/zyus/booklist/info` 的 body：
+
+```json
+{
+  "info": {
+    "name": "科幻", "desc": "…", "count": 2, "tags": ["科幻","银河奖"],
+    "isPublic": "public", "favNum": "0", "fav_num": 0, "favable": true,
+    "canAdd": "yes", "status": "normal", "updateTime": "刚刚",
+    "all_book_ids": ["10881716","11550952"],
+    "urlEdit": "…ca=Booklist.Edit&id=…",
+    "shareAction": {"Action":"share","Data":{…}}
+  },
+  "books": [{
+    "id": 10881716, "name": "…", "author": "刘慈欣", "bookRating": "9.1",
+    "book_desc": "创建人写的推荐理由", "description": "书籍内容简介",
+    "cover": "…", "category": "小说", "readable": true,
+    "is_removed": true, "like": "0", "dislike": "0", "adder": "i…"
+  }],
+  "user": {"name": "Dragon水魅", "avatar": "…"}
+}
+```
+
+- `book_desc` = 推荐理由（创建人手写），`description` = 书籍内容简介。**两者别混**，用户问"为什么推荐"看前者。
+- `is_removed: true` 表示该书在掌阅已下架（书单里仍保留条目）。**书单里下架书比例实测普遍 30%~67%**（如书单 129684 是 26/44）；此类书 `info` 查不到详情与价格、无法购买。`readable` 实测恒为 true，**不能**当在售判据，唯一可靠的判据就是 `is_removed`。脚本 `booklist` 人读输出已打 `[已下架]` 标，`--sale` 只显示在售书。
+- `count` 是真实书目数；每页 10 本，`page` 翻到空为止。
+- `listType=2`（我收藏的）每条多一个 `favorite_time`（日期，如 `2026-11-16`）。
+- **`myList` 里的 `books` 只是预览**：通常只回 1 本，且 `description` 是书籍内容简介而不是推荐理由。要列全书目/推荐理由必须另外调 `info`（`mybl --books` 就是这么做的）。
+- `status`：`normal` 正常、`check` 审核中（此时 `info` 返回 53002）。
+
+限制：
+
+| 项 | 限制 | 错误码 |
+|----|------|--------|
+| 名称 | 1~40 字 | 空 → `53003`；超长/敏感词 → `31215 文字内容违规` |
+| 描述 | 1~200 字 | 同上（**错误码不指明是哪个字段**） |
+| 单书单书目 | 100 本 | 客户端限制（`edit/a` 里硬编码） |
+| 我的书单分页 | `size` ≤ 20，`start` 从 1 起 | 超了返回 `2 size is greater than 20` |
+
+### 11.6 实测记录（2026-11-16）
+
+- 建单 → 加书 2 本 → 改名 → 移出 1 本 → 删单：全链路通过，`count` 每次都对得上。
+- `myList` 的 `start` 是**页码**不是 offset：`start=1` 返回第 1~size 条，`start=2` 从第 size+1 条开始。
+- `operate=like`/`dislike` 在 `book/operate` 下会返回成功但**把书目清空**，不要用。
+- 收藏/取消收藏别人的书单往返正常，`mybl --fav` 的 `total` 随之增减。
+- 加书后服务端会补全 `name`/`author`/`cover`（即使传空），所以加完回读一次能拿到真实书名。
+- **`update` 有两个副作用**（都实测复现）：
+  1. 书单被置为审核态 `status=check`，此状态下 `/zyus/booklist/info` **恒返回 `53002 获取数据错误`**（`myList` 仍可读）。等审核结束（本次约 1~2 分钟）才恢复。
+  2. 自动生成的 `tags` 被清空。`tags` 由书目分类汇总而来，`update` 不接收 `tags` 参数（传 `tags` 也照样清空），**只有重新加书才会重算回来**。
+  因此 `bledit` 只应在用户确实要改名称/描述时调用，不要顺手"统一"一下描述。
+- **审核态判定**：`myList` 里该条 `status` 字段为 `check`（正常是 `normal`）；此时 `info` 的 53002 不是故障。
+
+### 11.7 搜索翻页（searchMultiple 的 `type=bkList` / `type=book` 模式）★
+
+书城搜索结果页的「书单」「书籍」两个页签各有**两种请求形态**，对应 App 里「首屏」和「加载更多」两个动作。结论来自 APK 逆向（`classes6.dex` 的 `ih/b` 类，URL 拼接方法 `j`=书单 tab / `n`=书籍 tab）加 2026-11-16 实测。
+
+```http
+# 首屏（无 type）：书单第一屏 3 条 + 作者卡 + 同页书籍 + relatedSearch
+GET https://ah2.zhangyue.com/zybook3/u/p/api.php?Act=searchMultiple&keyWord=<关键词>&usr=&zysid=&p29=zye5b814&p2=104583&p3=18070403&p4=501603&p33=com.chaozh.iReaderFree
+
+# 加载更多（带 type）：只返回 bkList（书单列表），book/relatedSearch 节点不返回
+GET https://ah2.zhangyue.com/zybook3/u/p/api.php?Act=searchMultiple&keyWord=<关键词>&type=bkList&pageSize=<n>&currentPage=<m>&suggestType=0
+```
+
+- **翻页三件套是 `type=bkList` + `pageSize` + `currentPage`**。只传 `currentPage` 不传 `type` 无效（实测 `pageNo`/`page`/`pn` 等也全部无效，返回第 1 页）——这是此前"分页参数未公开"的原因，缺的不是页码参数而是 `type` 开关。
+- App 原生拼法里书单 tab 加 `type=bkList&pageSize=N&currentPage=M&suggestType=S`（逆向 `ih/b.j`）；书籍 tab 是 `type=book&pageSize=N&currentPage=M&filterAuthor=1&suggestType=S`（`ih/b.n`）。`suggestType` 传 0 实测有效，省略也可。
+- 书籍 tab 的 `filterAuthor=1` 会滤掉作者卡条目（data_type=1）；不传时第 1 页会多出一条 `data_type=1` 的作者卡。响应 body 只有 `book` 节点，`book.page` 结构与 `bkList.page` 相同。书籍条目的 `completeState` 是 **`Y`/`N` 字符串**（已完结/连载中），不是 0/1；`bookRating` 为 0 表示无评分。脚本命令 `bsearch`。
+- `/zybook3/u/p/api.php` 与 `/zybook/u/p/api.php` 两个路径实测行为一致，脚本统一用 App 真实的 `zybook3`。
+- **未登录（usr/zysid 空）可用**；`p2x` 渠道参数也可省（精简形态 `Act+keyWord+type+pageSize+currentPage` 即可）。
+- `pageSize` 实测 100 有效（`totalPage` 相应变为 1）；`currentPage` 超界**不报错**，返回空 `datas`，`page.currentPage` 被服务端钳制为最后实际页。
+- `bkList.page` 结构：`{"currentPage": 1, "totalPage": 12, "totalRecord": 36, "pageSize": 3}`（首屏固定 pageSize=3）。同一关键词 totalRecord 不随 pageSize 变。
+- 举例：`南派三叔` 共 36 个书单，`pageSize=50&currentPage=1` 一次拿全；`东野圭吾` 共 351 个，需按页翻。
+- `--all` 聚合上限 200 条是脚本本地防呆（防敏感词返回大结果时跑飞），不是服务端限制。
+
+## 12. 速率与并发
 
 - 分类页抓取：并发 8 稳定，无明显限流
 - 详情页查价：并发 8 稳定；全量约 9200 本耗时约 10 分钟
@@ -600,3 +883,52 @@ data=[{ "book_id":"11582366", "book_name":"某某书",
 - 搜索翻页之间加 0.1~0.2 秒间隔
 - 下单/加书架/移书/建删文件夹都是写操作，**串行执行、不要并发**；下单成功后 sleep 2 秒再校验
 - 书架类写操作之间留 1 秒并重取 `current_version`，避免乐观锁冲突
+- 书单写操作同样串行：`bladd` 逐本加、`blrm` 逐本删，脚本已内置 `delay`（默认 0.15s）
+
+## 13. 淘书市活动页（`taoshu` 命令，读操作）★
+
+> 完整逆向（含领券的 X-Nonce/X-Sign 双头签名）在姊妹仓库 `ireader_welfare/docs/掌阅逆向笔记.md` 第二十一节。本节只记 `ireader-picker` 用到的**读**部分：找活动 → 解析券与书目 → 查价推荐。
+
+### 13.1 活动入口：频道页滚动 banner（匿名）
+
+```http
+GET https://ah2.zhangyue.com/zybk/channel/ajaxrequest?page=1&key=ch_publish&index=0
+```
+
+返回 `{"code":0,"blockData":"<div class='slider-banner'>..."}`。每个 `li.slider-item` 一张 banner：
+
+| 抓取项 | 位置 |
+|--------|------|
+| 跳转地址 | `data-url`（淘书市那期是 `https://h5.zhangyue.com/opr/<act_id>.html?act_id=...`） |
+| banner 名称 | `data-point` JSON 的 `name`（如「淘书市180期」） |
+
+出版（`ch_publish`）/ 精选（`ch_feature`）两个频道都实测挂过同一期。同一 `data-url` 在两个频道重复出现，需按 act_id 去重。
+
+**识别三级判定**（为换期自适应，不写死 act_id）：① banner 名称含「淘书」→ 直接认定；② 名称不含 → 抓活动页正文确认含「淘书」；③ 全不含 → 页面含 `amp_coupon` 券组件的 opr 活动页兜底认定。未换期时滚动栏里没有 opr 链接，返回空列表（不是错误）。
+
+### 13.2 活动页：券与书目的数据结构（匿名）
+
+```http
+GET https://h5.zhangyue.com/opr/<act_id>.html?act_id=<act_id>&launch=inside
+```
+
+Vue SSR，带不带 usr/zysid 渲染结果一致。券与书目的 **id 都不在 HTML 里**，在每期一个的 JS bundle：
+
+```html
+<script src="https://static-tos-front-h.zhangyuecdn.com/opr/js/<act_id>.<hash>.js">
+```
+
+| 数据 | bundle 里的形态 | HTML 里的对应 |
+|------|----------------|---------------|
+| 满减券 product_id | `req_params:{ids:["31226",...]},req_type:"coupon"` | `amp_coupon_*` 块（面额 `<b>200</b>阅饼`、门槛 `满500阅饼使用`、有效期 `class="time"`） |
+| 活动书目 book_id | `req_params:{cart_id:"33484",ids:[...]},req_type:"book"`（56 个组件、约 150 本，去重保序） | SSR 有书名/作者/简介但**没有价格与 book_id** |
+
+配对规则：券的 HTML 块与 bundle ids 都是自上而下的组件顺序，直接顺序配对；数量对不上以 ids 为准、面额留空。书目 id 无需与 SSR 配对——价格回 `book.php` 详情页查（3 节），SSR 里的书名只作展示参考。
+
+**本期实测（180 期，2026-11-09 ~ 11-23）**：act_id `78nah1ma6g0`，券 4 张（200/满500、800/满2000、2400/满5000、5000/满10000），书目 151 本，特价为主（500~1500 阅饼居多）。
+
+### 13.3 与领券的分工
+
+领券（`POST /operation/wap/coupon_receive` + 签名）在 `ireader_welfare/src/ireader_welfare/taoshushi.py` 的 `claim_all()`，幂等（重复领取返回 200003 视为成功）。`ireader-picker` 不做领券——选书工具只读，写（入账）统一归福利工具。领完的券出现在 `/zyuc/coupon/ajaxrequest?index=1`（`Client.coupons("book")`），`buy` 新版通道自动抵扣。
+
+`taoshu` 的推荐口径与 `afford --coupon` 一致：门槛 ≤ 自付上限 + 面额才启用选券，券后自付 = max(价 − 面额, 0)，且要求 ≤ 自付上限。差异点：淘书市券与普通满减券是同一套 `/zyuc/coupon` 账目，`buy` 不区分来源、达到门槛即用。

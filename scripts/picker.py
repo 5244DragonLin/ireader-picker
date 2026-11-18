@@ -5,10 +5,12 @@
 设计要点
 --------
 * 查询类只读：`balance` / `coupons` / `afford` / `recommend` / `category` /
-  `search` / `info` / `shelves` 绝不动账号。
+  `search` / `info` / `shelves` / `mybl` / `blsuggest` / `taoshu` 绝不动账号。
 * 写操作有两类，都要显式确认：
   `buy` 扣券购买（必须 `--confirm`，否则只询价）；
-  `shelf` 加书架、`move` 移书、`mkdir` / `rmdir` 建删文件夹（均有 `--dry` 预览）。
+  `shelf` 加书架、`move` 移书、`mkdir` / `rmdir` 建删文件夹（均有 `--dry` 预览）；
+  `cartdel` 移出购物车、`blrm` 移出书单、`bldel` 删书单（默认预览，`--yes` 执行）；
+  `blnew` / `bledit` / `bladd` / `blfav` 直接生效（批量加书可用 `--dry` 预览）。
 * 查价不需要登录：book.php / 分类页 / 搜索都匿名可用；
   只有「余额、代金券/满减券明细、是否已拥有、下单」需要 usr + zysid。
 * 代金券与满减券是两套：代金券 1:1 抵阅饼、自动扣；满减券「满 X 减 Y」，
@@ -29,6 +31,9 @@
     python picker.py afford --full --limit 300    # 穷举全书城（慢，约 10 分钟）
     python picker.py recommend --limit 100        # 按热门程度推荐能买的书
     python picker.py recommend --sort score       # 按好评推荐
+    python picker.py taoshu                       # 淘书市当期书目：叠满减券后能买啥
+    python picker.py taoshu --show-coupons        # 只看当期券面额/门槛（不查价）
+    python picker.py taoshu --limit 600           # 自付上限显式指定
     python picker.py category 计算机               # 按分类推荐
     python picker.py search 聊斋                   # 按书名检索
     python picker.py search 推理 --genre           # 按类型/题材检索
@@ -43,6 +48,19 @@
     python picker.py move 10007034                # --to 留空 = 移出到未归类
     python picker.py mkdir 新夹                   # ⚠️ 新建文件夹
     python picker.py rmdir 新夹 --force           # ⚠️ 删文件夹（先把书移出，不丢书）
+    python picker.py cart                         # 购物车列表（含下架/失效标记，只读）
+    python picker.py cart --recd                  # 同时看基于购物车的推荐
+    python picker.py cartdel 10007034             # ⚠️ 移出购物车（默认预览，--yes 执行）
+    python picker.py mybl                         # 我的书单（我创建的，只读）
+    python picker.py mybl --books                 # 连每个书单里的书一起列
+    python picker.py mybl --fav                   # 我收藏的书单
+    python picker.py blnew 硬科幻 --desc 十本够读一年   # ⚠️ 建书单（--qiu 求书单）
+    python picker.py bledit 42379591 --name 新名   # ⚠️ 改书单名称/描述
+    python picker.py bladd 42379591 10007034      # ⚠️ 往书单加书（--dry 预览）
+    python picker.py blrm 42379591 10007034       # ⚠️ 移出书单（默认预览，--yes 执行）
+    python picker.py bldel 42379591               # ⚠️ 删书单（默认预览，--yes 执行）
+    python picker.py blfav 3264827                # ⚠️ 收藏别人的书单（--off 取消）
+    python picker.py blsuggest 三体                # 书单加书联想（只读）
 """
 from __future__ import annotations
 
@@ -78,11 +96,157 @@ APP_UA = ("Mozilla/5.0 (Linux; Android 11; M2012K11AC) AppleWebKit/537.36 "
 PC_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
          "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 PC_PAGE_PARAMS = "p29=zye5b814&p2=104583&p3=18070403&p4=501603&p33=com.chaozh.iReaderFree"
+# 购物车 add 的设备参数：服务端要求请求带非空的 p1（设备指纹占位）与 p3（客户端版本号），
+# 值本身任意（实测旧版本号/任意 hex 均可），缺任一参数业务层返回 53002 系统异常。
+# 与 App 真实请求对齐（DeviceInfor.setURL 构建的 pc/p1..p34 全家桶里只取必需的两个）。
+CART_DEVICE_PARAMS = "&p1=ffffffffffffffffffffffff&p3=18080103"
 
 # 频道 / 筛选 / 排序的语义（实测确认）
 CHANNELS = {"10": "男频", "68": "女频", "92": "出版"}
 STATUS = {"0": "全部", "1": "免费", "2": "特价", "3": "完结", "4": "VIP"}
 ORDERS = {"download": "热门", "score": "好评", "update": "最新"}
+
+# ================= 淘书市活动（与 ireader_welfare/taoshushi.py 同源链路） =================
+# 活动入口：书城「出版/精选」频道页顶部滚动 banner（约一月换两次期）。
+# 领券由 ireader_welfare 负责；本文件只做「读」：把当期活动页里的
+# 满减券（面额/门槛/product_id）与活动书目（book ids）抓出来，
+# 用于「叠加淘书市券后能买哪些书」的推荐。协议细节见
+# ireader_welfare/docs/掌阅逆向笔记.md 第二十一节。
+
+H5_BASE = "https://h5.zhangyue.com"
+TSS_CHANNEL_KEYS = ("ch_publish", "ch_feature")   # 滚动栏挂过的频道
+TSS_KEYWORDS = ("淘书",)                          # banner 名称/活动页正文识别词
+
+
+def _tss_fetch(url: str, timeout: int = 20) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": APP_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "ignore")
+
+
+def tss_banner_items(channel_key: str) -> list[tuple[str, str]]:
+    """频道页滚动栏 → [(跳转url, banner名称)]（匿名）。"""
+    try:
+        j = json.loads(_tss_fetch(
+            f"{APP_BASE}/zybk/channel/ajaxrequest?page=1&key={channel_key}&index=0"))
+    except (ValueError, OSError):
+        return []
+    html = (j.get("blockData") or "") if isinstance(j, dict) else ""
+    items = []
+    for m in re.finditer(r'<li[^>]*class="slider-item[^"]*"[^>]*>', html):
+        tag = m.group(0)
+        u = re.search(r'data-url="([^"]+)"', tag)
+        if not u:
+            continue
+        name = ""
+        pm = re.search(r"data-point='([^']*)'", tag)
+        if pm:
+            try:
+                name = (json.loads(pm.group(1)) or {}).get("name") or ""
+            except ValueError:
+                pass
+        items.append((u.group(1), name))
+    return items
+
+
+def tss_find_activities(channel_keys=TSS_CHANNEL_KEYS) -> list[tuple[str, str]]:
+    """在滚动栏里找淘书市/券活动页，返回 [(act_id, 来源)]。
+
+    与 ireader_welfare 同款三级判定，专为换期自适应：
+      ① banner 名称带「淘书」→ 直接认定
+      ② 抓活动页正文确认带「淘书」→ 认定
+      ③ 兜底：有券组件（amp_coupon）的 opr 活动页 → 认定
+    没有运营活动页（未换期）返回空列表。
+    """
+    named, to_check = [], []
+    seen: set[str] = set()
+    for key in channel_keys:
+        for url, name in tss_banner_items(key):
+            m = re.match(r"https?://h5\.zhangyue\.com/opr/([A-Za-z0-9]+)\.html", url)
+            if not m or m.group(1) in seen:
+                continue
+            seen.add(m.group(1))
+            if any(kw in name for kw in TSS_KEYWORDS):
+                named.append((m.group(1), f"banner「{name}」"))
+            else:
+                to_check.append(m.group(1))
+    if named:
+        return named
+    for act_id in to_check:
+        try:
+            html = _tss_fetch(f"{H5_BASE}/opr/{act_id}.html?act_id={act_id}&launch=inside")
+        except OSError:
+            continue
+        if any(kw in html for kw in TSS_KEYWORDS):
+            named.append((act_id, "活动页正文含淘书"))
+        elif "amp_coupon" in html:
+            named.append((act_id, "滚动栏券活动（兜底）"))
+        time.sleep(0.5)
+    return named
+
+
+def tss_bundle_url(act_id: str, html: str) -> str:
+    """从活动页 HTML 抠出当期 bundle 地址（券与书目的 product_id 都在里面）。"""
+    m = re.search(rf'src="[^"]*/opr/js/{re.escape(act_id)}\.([0-9a-f]+)\.js"', html)
+    if m:
+        return f"https://static-tos-front-h.zhangyuecdn.com/opr/js/{act_id}.{m.group(1)}.js"
+    for m in re.finditer(r'src="([^"]*/opr/js/[a-z0-9]+\.[0-9a-f]+\.js)"', html):
+        name = m.group(1).rsplit("/", 1)[-1]
+        if not name.startswith("chunk-"):
+            return m.group(1) if m.group(1).startswith("http") else f"https:{m.group(1)}"
+    return ""
+
+
+def tss_parse_coupons(bundle_js: str, html: str) -> list[dict]:
+    """券列表 [{product_id, amount, quota, valid}]。
+
+    product_id 在 bundle 的 req_params.ids（req_type:"coupon"，按组件顺序）；
+    面额/门槛在 SSR 的 amp_coupon 块，两边都自上而下 → 顺序配对。
+    数量对不上时以 ids 为准、面额留空（宁可少显示不错配）。
+    """
+    ids: list[str] = []
+    for m in re.finditer(r'req_params:\{ids:\[([^\]]*)\]\},req_type:"coupon"', bundle_js):
+        ids.extend(re.findall(r'"(\d+)"', m.group(1)))
+    infos = []
+    for b in re.split(r'(?=<div id="anchor_\d+" class="amp_coupon)', html)[1:]:
+        amounts = re.findall(r"<b[^>]*>(?:<[^>]+>)*([\d.]+)", b)
+        quotas = re.findall(r"<p[^>]*>(满[\d.]+阅饼[^<]*)</p>", b)
+        valid = re.findall(r'class="time"[^>]*>([^<]+)<', b)
+        for i, amt in enumerate(amounts):
+            infos.append({"amount": float(amt),
+                          "quota": quotas[i] if i < len(quotas) else "",
+                          "valid": valid[0] if valid else ""})
+    return [{"product_id": pid, **(infos[i] if i < len(infos) else
+             {"amount": None, "quota": "", "valid": ""})}
+            for i, pid in enumerate(ids)]
+
+
+def tss_parse_books(bundle_js: str) -> list[str]:
+    """活动书目 ids（bundle 的 req_type:"book" 组件，去重保序，约 150 本/期）。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in re.finditer(r'req_params:\{cart_id:"\d+",ids:\[([^\]]*)\]\},'
+                         r'req_type:"book"', bundle_js):
+        for x in re.findall(r'"(\d+)"', m.group(1)):
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+    return out
+
+
+def tss_load(act_id: str) -> dict:
+    """当期活动全量：{act_id, coupons, book_ids, found}。"""
+    html = _tss_fetch(f"{H5_BASE}/opr/{act_id}.html?act_id={act_id}&launch=inside")
+    bundle = ""
+    bu = tss_bundle_url(act_id, html)
+    if bu:
+        bundle = _tss_fetch(bu)
+    return {
+        "act_id": act_id,
+        "coupons": tss_parse_coupons(bundle, html) if bundle else [],
+        "book_ids": tss_parse_books(bundle) if bundle else [],
+    }
+
 
 # 分类名 → (频道, cid)。由脚本自动抓取，这里只留常用别名便于直接 -c 指定
 CATEGORY_ALIAS = {
@@ -500,6 +664,40 @@ def save_credentials(usr: str, zysid: str) -> str:
     return path
 
 
+def _auth_field(auth: str, name: str) -> str:
+    """从 "usr=iXXX&zysid=YYY" 凭证串里取单个字段。"""
+    for part in auth.split("&"):
+        k, _, v = part.partition("=")
+        if k.strip() == name:
+            return v.strip()
+    return ""
+
+
+_CART_KEY: list = []
+
+
+def _cart_private_key():
+    """客户端签名用的 RSA 私钥（与登录同族，服务端只认第 4 把）。
+
+    购物车（`/zyuc/api/cart/cart`）与书单（`/zyus/booklist/*`）共用这把。
+    """
+    if _CART_KEY:
+        return _CART_KEY[0]
+    try:
+        import base64
+        from cryptography.hazmat.primitives.serialization import load_der_private_key
+    except ImportError:
+        raise RuntimeError(
+            "该接口需要 cryptography 库：python -m pip install cryptography")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "native_keys.json")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    key = load_der_private_key(base64.b64decode(raw[3]["der_b64"]), password=None)
+    _CART_KEY.append(key)
+    return key
+
+
 # ---------------------------------------------------------------- 客户端
 
 class Client:
@@ -631,6 +829,88 @@ class Client:
                 usable.append(v)
         usable.sort(key=lambda v: v["expire"])
         return sum(v["amount"] for v in usable), usable
+
+    # ---------- 购物车（新版，zyuc/api/cart/cart）----------
+
+    def _cart_signed_url(self, act: str, extra: str = "") -> str:
+        """购物车接口 URL：sign = SHA1withRSA("act=..&timestamp=..&usr=.."，客户端私钥第 4 把)。
+
+        实测签名串固定只含 act/timestamp/usr 三个参数（多一个都返回 53001 签名错误）；
+        bookId/books 等业务参数拼在签名之后，不参与签名。需要 cryptography 库。
+        另拼 CART_DEVICE_PARAMS：add 动作服务端要求 p1/p3 非空，缺了返回 53002。
+        """
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        import base64
+        key = _cart_private_key()
+        ts = str(int(time.time() * 1000))
+        usr = _auth_field(self.auth, "usr")
+        msg = f"act={act}&timestamp={ts}&usr={usr}"
+        sign = base64.b64encode(
+            key.sign(msg.encode(), padding.PKCS1v15(), hashes.SHA1())).decode()
+        dev = CART_DEVICE_PARAMS if act == "add" else ""
+        q = (f"act={act}&timestamp={ts}&usr={usr}"
+             f"&sign={urllib.parse.quote(sign, safe='')}{extra}"
+             f"&{self.auth}&pluginVersion=34{dev}")
+        return f"{APP_BASE}/zyuc/api/cart/cart?{q}"
+
+    def cart_request(self, act: str, extra: str = "") -> dict:
+        """调购物车接口并解析 JSON。code!=0 时抛 RuntimeError 带原始 code/msg。"""
+        t = _fetch(self._cart_signed_url(act, extra), APP_UA)
+        try:
+            j = json.loads(t)
+        except ValueError:
+            raise RuntimeError(f"购物车接口返回异常：{t[:200] or '(空)'}")
+        if j.get("code") != 0:
+            raise RuntimeError(f"购物车接口 code={j.get('code')} msg={j.get('msg')}")
+        return j.get("body") or {}
+
+    def cart_list(self) -> dict:
+        """购物车列表：分组（type/typeName/couponInfo）+ 书目（BookInCart）。
+
+        书目字段：bookId/bookName/author/price/priceDesc/state/selectStatus/
+        buyDesc/isDiscount/diff/voucherDesc/picUrl/url。
+        state：0=正常 1=免费 2=下架 3=失效（下架/失效不支持结算）。
+        """
+        body = self.cart_request("list")
+        groups = []
+        for g in body.get("books", []):
+            groups.append({
+                "type": g.get("type"),
+                "type_name": g.get("typeName", ""),
+                "coupon_info": g.get("couponInfo") or {},
+                "books": g.get("bookList", []),
+            })
+        return {"groups": groups, "limit": body.get("booksLimit"),
+                "rule_url": body.get("ruleUrl", "")}
+
+    def cart_count(self) -> int | None:
+        """旧通道购物车数量（app.php?ca=Cart.Num）。与新版购物车是两套库。"""
+        t = _fetch(f"{APP_BASE}/zybook3/app/app.php?ca=Cart.Num&{self.auth}", APP_UA)
+        try:
+            return int(json.loads(t).get("num"))
+        except (ValueError, TypeError):
+            return None
+
+    def cart_recd(self) -> list[dict]:
+        """基于购物车的推荐书目（bookId/bookName/picUrl）。"""
+        body = self.cart_request("recd")
+        return body.get("list", [])
+
+    def cart_del(self, bids: list[str], category: int = 1) -> dict:
+        """从购物车删除书目。books=[{"bookId":..,"bookCategory":..}] JSON，不参与签名。"""
+        books = json.dumps([{"bookId": int(b), "bookCategory": category} for b in bids],
+                           separators=(",", ":"))
+        return self.cart_request("del", f"&books={urllib.parse.quote(books, safe='')}")
+
+    def cart_add(self, bid: str, category: int = 1) -> dict:
+        """加入购物车（act=add&bookId=..&bookCategory=..）。
+
+        服务端要求请求携带非空的 p1（设备指纹）与 p3（客户端版本号），
+        由 CART_DEVICE_PARAMS 提供；缺了返回 53002 系统异常（已实测破案）。
+        幂等性差：重复加同一本返回 53002，调用前先查 cart_list。
+        """
+        return self.cart_request("add", f"&bookId={bid}&bookCategory={category}")
 
     # ---------- 书架 / 拥有状态 ----------
 
@@ -809,6 +1089,541 @@ class Client:
                 except Exception:
                     pass
         return out
+
+    # ---------- 作者主页 ----------
+
+    _RE_AUTHOR_ROLE = re.compile(
+        r'<span class="it red" data-js="author-page" data-un="([^"]+)"'
+        r' data-url="([^"]+)">([^<]+)</span>')
+
+    def author_page(self, bid: str) -> dict:
+        """按任一作品抓作者主页：作者简介 + 名下全部作品。
+
+        数据源是掌阅作者主页（书籍详情页作者区带 data-un，指向
+        /zyuc/homepage/），不是 App 搜索里的作者卡片；调用链：
+        书籍页拿 data-un -> 主页拿简介与作品数 -> 全部作品分页。
+        名下作品不区分[著]/[译]挂名，也不区分出版/网文。
+        """
+        book_html = _fetch(f"{APP_BASE}/zybook3/u/p/book.php?key=17B{bid}&rgt=", APP_UA)
+        roles = [{"un": un, "display": name.strip(), "url": url}
+                 for un, url, name in self._RE_AUTHOR_ROLE.findall(book_html)]
+        if not roles:
+            return {"ok": False, "msg": "该书详情页没有作者主页入口",
+                    "source_book": str(bid)}
+        role = next((r for r in roles if "[著]" in r["display"]), roles[0])
+        un = role["un"]
+        source_name = ""
+        mn = re.search(r"<dt>([^<]{1,80})</dt>", book_html)
+        source_name = mn.group(1).strip() if mn else f"book {bid}"
+
+        home = _fetch(f"{APP_BASE}/zyuc/homepage/home/index?pk=17B{bid}"
+                      f"&visitorName={un}&rgt=", APP_UA)
+        mn = re.search(r'data-nick="([^"]*)"\s*data-utag="([^"]*)"', home)
+        name = mn.group(1) if mn else ""
+        utag = mn.group(2) if mn else ""
+        strip = lambda s: re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s or "")).strip()
+        mi = re.search(r'<div class="user_brif[^"]*"[^>]*>(.*?)</div>', home, re.S)
+        mt = re.search(r'data-js="allmybook"[^>]*>\s*([^<]+?)\s*<', home)
+        mw = re.search(r'<em class="sub_title">([^<]*)</em>', home)
+
+        booklist_url = (f"{APP_BASE}/zyuc/homepage/booklist"
+                        f"?group=author&visitorName={un}&rgt=")
+        bl = _fetch(booklist_url, APP_UA)
+        mp = re.search(r'totalpage="(\d+)"', bl)
+        pages = int(mp.group(1)) if mp else 1
+        works, seen = [], set()
+        for page in range(1, pages + 1):
+            if page == 1:
+                html = bl
+            else:
+                raw = _fetch(f"{booklist_url}&currentPage={page}", APP_UA)
+                try:
+                    html = (json.loads(raw) or {}).get("html") or ""
+                except ValueError:
+                    break
+            for wbid, wname in re.findall(r'data-bid="(\d+)"\s+data-bname="([^"]*)"', html):
+                if wbid not in seen:
+                    seen.add(wbid)
+                    works.append({"bid": wbid, "name": wname})
+        return {
+            "ok": True, "un": un, "role": role["display"], "roles": roles,
+            "source_book": str(bid), "source_book_name": source_name,
+            "name": name, "utag": utag,
+            "intro": strip(mi.group(1)) if mi else "",
+            "total_books": len(works),
+            "all_books_label": mt.group(1).strip() if mt else "",
+            "total_words": mw.group(1).strip() if mw else "",
+            "works": works,
+        }
+
+    # ---------- 书单搜索与详情 ----------
+
+    def search_booklist(self, keyword: str, page: int = 1,
+                        page_size: int = 3, paginated: bool = False) -> dict:
+        """书城搜索结果里的「书单」页签 + 作者卡 + 相关搜索。
+
+        数据源：/zybook3/u/p/api.php?Act=searchMultiple（App 搜索多栏接口）。
+        两种模式（对应 App 的两种请求）：
+          paginated=False（默认）：首屏请求（不带 type），返回第一屏书单
+            （App 固定 pageSize=3）+ 作者卡 + 同页书籍 + 相关搜索。
+          paginated=True：书单 tab「加载更多」请求（App 原生拼法，逆向自
+            classes6.dex 的 Lih/b;->j）：type=bkList&pageSize=N&currentPage=M，
+            只返回书单列表，book/relatedSearch 节点不返回（App 同样如此）。
+        翻页实测：未登录（usr/zysid 空）可用；pageSize 100 实测有效；
+        currentPage 超界不报错、返回空 datas，page.currentPage 被服务端
+        纠正为最后实际页。
+        """
+        def _req(extra: dict) -> dict:
+            q = {"Act": "searchMultiple", "keyWord": keyword,
+                 "usr": _auth_field(self.auth, "usr") or "",
+                 "zysid": _auth_field(self.auth, "zysid") or "",
+                 "p29": "zye5b814", "p2": "104583", "p3": "18070403",
+                 "p4": "501603", "p33": "com.chaozh.iReaderFree"}
+            q.update(extra)
+            raw = _fetch(f"{APP_BASE}/zybook3/u/p/api.php"
+                         f"?{urllib.parse.urlencode(q)}", APP_UA)
+            try:
+                return (json.loads(raw).get("body") or {})
+            except ValueError:
+                return {}
+
+        def _parse_bl(d: dict) -> dict:
+            return {
+                "id": d.get("id"), "name": d.get("name"),
+                "description": d.get("description"),
+                "tags": d.get("tags") or [], "count": d.get("count"),
+                "fav_num": d.get("fav_num"), "like": d.get("like"),
+                "user_nick": d.get("user_nick"), "fullUrl": d.get("fullUrl"),
+            }
+
+        out = {"ok": False, "keyword": keyword, "booklists": [],
+               "author_card": None, "books": [], "related": []}
+
+        if paginated:
+            bl = _req({"type": "bkList",
+                       "pageSize": max(1, min(page_size, 100)),
+                       "currentPage": max(1, page)}).get("bkList") or {}
+            out["ok"] = bool(bl)
+            out["mode"] = f"page:{page}"
+            out["bk_page"] = bl.get("page") or {}
+            for d in bl.get("datas") or []:
+                out["booklists"].append(_parse_bl(d))
+            return out
+
+        body = _req({})
+        out["ok"] = True
+        bl = body.get("bkList") or {}
+        out["bk_page"] = bl.get("page") or {}
+        for d in bl.get("datas") or []:
+            out["booklists"].append(_parse_bl(d))
+        book = body.get("book") or {}
+        if isinstance(book, str):
+            try:
+                book = json.loads(book)
+            except ValueError:
+                book = {}
+        for d in book.get("datas") or []:
+            info = d.get("data_info") or {}
+            if str(d.get("data_type")) == "1":
+                out["author_card"] = {
+                    "authorName": info.get("authorName"),
+                    "synopsis": info.get("synopsis"),
+                    "usr": info.get("usr"),
+                    "fullUrl": d.get("fullUrl"),
+                }
+            else:
+                out["books"].append(self._parse_book_entry(d))
+        rs = body.get("relatedSearch") or {}
+        out["related"] = rs.get("datas") if isinstance(rs, dict) else (rs if isinstance(rs, list) else [])
+        return out
+
+    @staticmethod
+    def _parse_book_entry(d: dict) -> dict:
+        """searchMultiple 的书籍条目（data_type=0）→ 统一字段。"""
+        info = d.get("data_info") or {}
+        cats = info.get("leafCategoryName") or []
+        return {
+            "bid": info.get("bookId"),
+            "name": info.get("displayBookName") or info.get("bookName"),
+            "author": info.get("bookAuthor"),
+            "rating": info.get("bookRating"),
+            "tag": info.get("tag"),
+            "category": cats[0] if cats else "",
+            "complete": info.get("completeState"),
+            "fullUrl": d.get("fullUrl"),
+        }
+
+    def search_booklist_all(self, keyword: str, page_size: int = 50,
+                            max_records: int = 200) -> dict:
+        """书单搜索自动翻页：按 type=bkList 模式逐页抓取并去重聚合。
+
+        page_size 默认 50（实测可用，一次能覆盖大多数关键词的全部结果），
+        命中 max_records 上限或没有新 id 时停止。author_card/books/related
+        在该模式下接口不返回，恒为空。
+        """
+        seen, all_bls = set(), []
+        pages_meta: dict = {}
+        page, total = 1, 0
+        while True:
+            r = self.search_booklist(keyword, page=page, page_size=page_size,
+                                     paginated=True)
+            if not r.get("ok"):
+                break
+            pages_meta = r.get("bk_page") or {}
+            total = int(pages_meta.get("totalRecord") or 0)
+            new = 0
+            for b in r.get("booklists") or []:
+                if b.get("id") not in seen:
+                    seen.add(b.get("id"))
+                    all_bls.append(b)
+                    new += 1
+            cur = int(pages_meta.get("currentPage") or 0)
+            total_pg = int(pages_meta.get("totalPage") or 0)
+            if (not new or len(all_bls) >= max_records
+                    or len(all_bls) >= total or cur >= total_pg):
+                break
+            time.sleep(self.delay)
+            page = cur + 1
+        return {
+            "ok": True, "keyword": keyword, "mode": "all",
+            "booklists": all_bls, "bk_page": pages_meta,
+            "fetched": len(all_bls), "total": total,
+            "author_card": None, "books": [], "related": [],
+        }
+
+    def search_book(self, keyword: str, page: int = 1,
+                    page_size: int = 20) -> dict:
+        """书城搜索结果「书籍」页签（searchMultiple 的 type=book 模式）。
+
+        逆向自 classes6.dex 的 Lih/b;->n，App「加载更多」拼法：
+        type=book&pageSize=N&currentPage=M&filterAuthor=1&suggestType=S。
+        filterAuthor=1 会把作者卡（data_type=1）滤掉，只返回书籍条目；
+        body 只返回 book 节点（含自身 page 元信息），无书单/相关搜索。
+        实测边界与书单 tab 一致：未登录可用、pageSize 100 有效、
+        currentPage 超界返回空 datas。
+        """
+        q = {"Act": "searchMultiple", "keyWord": keyword,
+             "usr": _auth_field(self.auth, "usr") or "",
+             "zysid": _auth_field(self.auth, "zysid") or "",
+             "p29": "zye5b814", "p2": "104583", "p3": "18070403",
+             "p4": "501603", "p33": "com.chaozh.iReaderFree",
+             "type": "book", "pageSize": max(1, min(page_size, 100)),
+             "currentPage": max(1, page), "filterAuthor": 1,
+             "suggestType": 0}
+        raw = _fetch(f"{APP_BASE}/zybook3/u/p/api.php"
+                     f"?{urllib.parse.urlencode(q)}", APP_UA)
+        book = {}
+        try:
+            book = (json.loads(raw).get("body") or {}).get("book") or {}
+        except ValueError:
+            pass
+        if isinstance(book, str):
+            try:
+                book = json.loads(book)
+            except ValueError:
+                book = {}
+        out = {"ok": bool(book), "keyword": keyword,
+               "mode": f"page:{page}", "book_page": book.get("page") or {},
+               "books": []}
+        for d in book.get("datas") or []:
+            out["books"].append(self._parse_book_entry(d))
+        return out
+
+    def search_book_all(self, keyword: str, page_size: int = 50,
+                        max_records: int = 200) -> dict:
+        """书籍搜索自动翻页：按 type=book 模式逐页抓取并去重聚合。
+
+        page_size 默认 50，命中 max_records 上限、没有新 id 或抓满
+        totalRecord 时停止。作者卡在该模式下不返回（filterAuthor=1），
+        要作者卡用 blsearch 默认模式或 author 命令。
+        """
+        seen, all_books = set(), []
+        pages_meta: dict = {}
+        page, total = 1, 0
+        while True:
+            r = self.search_book(keyword, page=page, page_size=page_size)
+            if not r.get("ok"):
+                break
+            pages_meta = r.get("book_page") or {}
+            total = int(pages_meta.get("totalRecord") or 0)
+            new = 0
+            for b in r.get("books") or []:
+                if b.get("bid") not in seen:
+                    seen.add(b.get("bid"))
+                    all_books.append(b)
+                    new += 1
+            cur = int(pages_meta.get("currentPage") or 0)
+            total_pg = int(pages_meta.get("totalPage") or 0)
+            if (not new or len(all_books) >= max_records
+                    or len(all_books) >= total or cur >= total_pg):
+                break
+            time.sleep(self.delay)
+            page = cur + 1
+        return {
+            "ok": True, "keyword": keyword, "mode": "all",
+            "books": all_books, "book_page": pages_meta,
+            "fetched": len(all_books), "total": total,
+        }
+
+    def booklist_detail(self, blid: str) -> dict:
+        """书单详情：书单内书列表（H5 页，每页 5 本；更多书的翻页接口未公开）。"""
+        q = urllib.parse.urlencode({
+            "ca": "Booklist.Detail", "id": blid, "key": f"4B552_{blid}",
+            "pk": "CLI_SEARCH",
+            "usr": _auth_field(self.auth, "usr") or "",
+            "zysid": _auth_field(self.auth, "zysid") or "",
+            "p29": "zye5b814", "p2": "104583", "p3": "18070403",
+            "p4": "501603", "p33": "com.chaozh.iReaderFree",
+        })
+        t = _fetch(f"{APP_BASE}/zybook3/app/app.php?{q}", APP_UA)
+        out = {"ok": bool(t.strip()), "id": str(blid), "books": [],
+               "like": None, "title": "", "description": ""}
+        m = re.search(r"var _likeNumber = (\d+)", t)
+        if m:
+            out["like"] = int(m.group(1))
+        mt = re.search(r"<h1[^>]*>([^<]{2,50})</h1>", t)
+        if mt:
+            out["title"] = mt.group(1).strip()
+        md = re.search(r'class="user_brif[^"]*"[^>]*>(.*?)</div>', t, re.S)
+        if md:
+            out["description"] = re.sub(
+                r"\s+", " ", re.sub(r"<[^>]+>", "", md.group(1))).strip()
+        for mm in re.finditer(
+                r"openBookPage\('(\d+)'[^>]*>(.*?)<dt[^>]*>([^<]+)</dt>\s*"
+                r'<dd class="author">([^<]*)</dd>(.*?)</dl>', t, re.S):
+            reason = ""
+            mr = re.search(r"推荐理由：</span>\s*(.*?)</p>", mm.group(5), re.S)
+            if mr:
+                reason = re.sub(r"<[^>]+>", "", mr.group(1)).strip()
+            out["books"].append({"bid": mm.group(1), "name": mm.group(3).strip(),
+                                 "author": mm.group(4).strip(), "reason": reason})
+        mpage = re.search(r'totalPage="(\d+)"', t)
+        if mpage:
+            out["total_pages"] = int(mpage.group(1))
+        return out
+
+    # ---------- 我的书单（原生 /zyus/booklist/*，写操作）----------
+
+    def _bl_request(self, path: str, params: dict, signed: list[str] | None = None,
+                    post: bool = False) -> dict:
+        """调 `/zyus/booklist/*` 并解析 JSON；code!=0 抛 RuntimeError（带原始 code/msg）。
+
+        GET 接口（`myList`/`info`）参数放 query；POST 接口（`add`/`update`/`operate`/
+        `book/operate`）**全部参数放 body**，`zysid` 单独留在 query。两种情况下
+        `sign` 都随其它参数一起走，`signed` 决定签哪些 key（`None` = 签全部）。
+        """
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        import base64
+        key = _cart_private_key()
+        p = {k: v for k, v in params.items() if v is not None}
+        p["timestamp"] = str(int(time.time() * 1000))
+        p["usr"] = _auth_field(self.auth, "usr")
+        keys = sorted(p) if signed is None else sorted(signed)
+        msg = "&".join(f"{k}={p[k]}" for k in keys if p.get(k) not in (None, ""))
+        p["sign"] = base64.b64encode(
+            key.sign(msg.encode(), padding.PKCS1v15(), hashes.SHA1())).decode()
+        zysid = _auth_field(self.auth, "zysid")
+        base = f"{APP_BASE}{path}?zysid={urllib.parse.quote(zysid, safe='')}"
+        if post:
+            t = _post(base, urllib.parse.urlencode(p).encode(),
+                      "application/x-www-form-urlencoded", APP_UA)
+        else:
+            t = _fetch(f"{base}&{urllib.parse.urlencode(p)}", APP_UA)
+        try:
+            j = json.loads(t)
+        except ValueError:
+            raise RuntimeError(f"书单接口返回异常：{t[:200] or '(空)'}")
+        if j.get("code") != 0:
+            raise RuntimeError(f"书单接口 code={j.get('code')} msg={j.get('msg')}")
+        return j.get("body") or {}
+
+    def my_booklists(self, list_type: str = "1", size: int = 20) -> dict:
+        """我的书单列表（`/zyus/booklist/myList`，自动翻页）。
+
+        `list_type`：`1`=我创建的书单、`2`=我收藏的书单。`start` 是**页码**（从 1 起，
+        不是 offset），服务端每页最多 20 条。返回 `{total, lists[]}`，每条含
+        id/name/description/tags/count/like/fav_num/create_time/update_time/
+        is_public/type/status/owner/user_nick/books[]（列表里带前若干本书）。
+        """
+        size = max(1, min(int(size), 20))
+        lists, total, page = [], None, 1
+        while True:
+            b = self._bl_request("/zyus/booklist/myList",
+                                 {"listType": list_type, "start": str(page),
+                                  "size": str(size)},
+                                 signed=["timestamp", "usr"])
+            total = b.get("total", total)
+            batch = b.get("book_lists") or []
+            lists += batch
+            if len(batch) < size or (total is not None and len(lists) >= int(total)):
+                break
+            page += 1
+            if page > 50:      # 保险丝，防止 total 异常时死循环
+                break
+            time.sleep(self.delay)
+        return {"total": total if total is not None else len(lists),
+                "list_type": str(list_type), "lists": lists}
+
+    def booklist_info(self, blid: str, page: int = 1, is_edit: bool = False) -> dict:
+        """书单详情（原生接口，自动翻页取全书目）。
+
+        比 H5 的 `booklist_detail` 强：一次能拿到书单元信息（名称/描述/标签/
+        收藏数/是否可补书）+ 全部书目（含每本书的推荐理由 `book_desc`）。
+        服务端每页 10 本；`is_edit=True` 时会带编辑态字段（`canAdd` 等）。
+
+        **书单处于审核态（`status=check`，常见于刚建单或刚加过书）时，本接口
+        一律返回 `53002 获取数据错误`**。这时抛出的 RuntimeError 里会带
+        `under_review=True` 标记，调用方据此提示「审核中」而不是报故障。
+        """
+        meta: dict = {}
+        books: list[dict] = []
+        last: dict = {}
+        for pg in range(1, 41):
+            try:
+                b = self._bl_request("/zyus/booklist/info",
+                                     {"bookListId": str(blid),
+                                      "isEdit": "1" if is_edit else "0",
+                                      "page": str(pg)})
+            except RuntimeError as e:
+                if "53002" in str(e) and pg == 1:
+                    raise RuntimeError(
+                        f"书单 {blid} 读不到（多为审核中，稍后重试）：{e}"
+                    ) from e
+                break       # 后续页失败就当翻到头
+            last = b
+            meta = meta or (b.get("info") or {})
+            batch = b.get("books") or []
+            books += batch
+            cnt = meta.get("count")
+            if not batch or (cnt is not None and len(books) >= int(cnt)):
+                break
+            time.sleep(self.delay)
+        out = dict(meta)
+        out["id"] = str(blid)
+        out["books"] = books
+        out["user"] = last.get("user") or {}
+        return out
+
+    def booklist_create(self, name: str, desc: str, book_type: str = "1") -> dict:
+        """创建书单（`/zyus/booklist/add`，⚠️ 写操作）。
+
+        `book_type`：`1`=晒书单（默认）、`2`=求书单。服务端要求 `name` 1~40 字、
+        `desc` 1~200 字（超出/含敏感词统一返回 `31215 文字内容违规`）。
+
+        **`addBooks` 只能传空数组**：服务端会拿新建书单的空 id 去做 `int()` 转换，
+        任何非空结构都报 `invalid literal for int() with base 10: ''`。想建单就带书，
+        只能先建空单再逐本调 `booklist_add_book()`（CLI 的 `blnew --add` 即如此）。
+        """
+        payload = {
+            "bookType": str(book_type),
+            "name": name,
+            "desc": desc,
+            "addBooks": "[]",
+        }
+        b = self._bl_request("/zyus/booklist/add", payload, post=True)
+        return {"id": str(b.get("id", "")), "name": name}
+
+    def booklist_update(self, blid: str, name: str, desc: str,
+                        add_books: list[dict] | None = None,
+                        update_books: list[dict] | None = None) -> dict:
+        """改书单名称/描述（`/zyus/booklist/update`，⚠️ 写操作）。
+
+        签名只含 `bookListId`/`name`/`desc`/`timestamp`/`usr`；两个 JSON 字段
+        （`addBooks` 补书、`updateBooks` 改推荐理由）随 body 一起发、**不参与签名**。
+        两者传空列表也合法（服务端不会因此清空书目）。
+        """
+        params = {"bookListId": str(blid), "name": name, "desc": desc,
+                  "addBooks": json.dumps(add_books or [], ensure_ascii=False),
+                  "updateBooks": json.dumps(update_books or [], ensure_ascii=False)}
+        self._bl_request("/zyus/booklist/update", params,
+                         signed=["bookListId", "name", "desc", "timestamp", "usr"],
+                         post=True)
+        return {"id": str(blid), "name": name}
+
+    def booklist_delete(self, blid: str) -> dict:
+        """删除自己的书单（`/zyus/booklist/operate` operate=delete，⚠️ 写操作）。"""
+        self._bl_request("/zyus/booklist/operate",
+                         {"operate": "delete", "bookListId": str(blid)},
+                         signed=["operate", "bookListId", "timestamp", "usr"],
+                         post=True)
+        return {"id": str(blid), "deleted": True}
+
+    def booklist_favorite(self, blid: str, add: bool = True) -> dict:
+        """收藏 / 取消收藏书单（operate=addFavorite / deleteFavorite，⚠️ 写操作）。"""
+        act = "addFavorite" if add else "deleteFavorite"
+        self._bl_request("/zyus/booklist/operate",
+                         {"operate": act, "bookListId": str(blid)},
+                         signed=["operate", "bookListId", "timestamp", "usr"],
+                         post=True)
+        return {"id": str(blid), "favorite": bool(add)}
+
+    def booklist_remove_book(self, blid: str, bids: list[str]) -> dict:
+        """把书移出书单（`/zyus/booklist/book/operate` operate=delete，⚠️ 写操作）。
+
+        注意 `operate=add` 走不通（服务端返回 53002），加书只能用 `booklist_add_book`。
+        """
+        done = []
+        for bid in bids:
+            self._bl_request("/zyus/booklist/book/operate",
+                             {"operate": "delete", "bookListId": str(blid),
+                              "bookId": str(bid)},
+                             signed=["operate", "bookListId", "bookId",
+                                     "timestamp", "usr"],
+                             post=True)
+            done.append(str(bid))
+            time.sleep(self.delay)
+        return {"id": str(blid), "removed": done}
+
+    def booklist_add_book(self, blid: str, bid: str, name: str = "",
+                          author: str = "", desc: str = "", pic: str = "",
+                          is_isbn: bool = False) -> dict:
+        """往书单加一本书（H5 `Booklist.AddOneBook`，⚠️ 写操作）。
+
+        原生 `book/operate` 的 `add` 动作服务端不认（53002），加书实际走 H5 这条，
+        与 App 内置编辑页同源。同一本书重复加返回 `31206 该图书已存在`。
+        `bid` 传数字 book_id 或 `ISBN:xxx`（`is_isbn=True` 时 `type=0`）。
+        """
+        body = {
+            "id": str(blid), "bid": str(bid),
+            "type": "0" if is_isbn else "1",
+            "name": name, "author": author, "pic": pic, "desc": desc,
+            "timestamp": str(int(time.time() * 1000)),
+        }
+        url = (f"{APP_BASE}/zybook3/app/app.php"
+               f"?ca=Booklist.AddOneBook&{urllib.parse.urlencode(self._pc_auth_params())}")
+        raw = _post(url, urllib.parse.urlencode(body).encode(),
+                    "application/x-www-form-urlencoded", APP_UA)
+        try:
+            j = json.loads(raw)
+        except ValueError:
+            raise RuntimeError(f"加书接口返回异常：{raw[:200] or '(空)'}")
+        if j.get("code") != 0:
+            raise RuntimeError(f"加书接口 code={j.get('code')} msg={j.get('msg')}")
+        return {"id": str(blid), "bid": str(bid), "added": True}
+
+    def booklist_suggest(self, keyword: str, blid: str = "0") -> list[dict]:
+        """书单加书时的联想搜索（H5 `Booklist.Suggest`，只读）。
+
+        返回 `[{id, type, name, author, pic}]`；`type=1` 是掌阅在售书（`id` 为
+        数字 book_id），`type=0` 是豆瓣 ISBN 书（`id` 形如 `ISBN:9787...`）。
+        """
+        q = urllib.parse.urlencode({"ca": "Booklist.Suggest", "keyword": keyword,
+                                    "id": str(blid),
+                                    **self._pc_auth_params()})
+        t = _fetch(f"{APP_BASE}/zybook3/app/app.php?{q}", APP_UA)
+        try:
+            j = json.loads(t)
+        except ValueError:
+            return []
+        return j if isinstance(j, list) else []
+
+    def _pc_auth_params(self) -> dict:
+        """H5 接口通用参数（页面参数 + 凭证）。"""
+        return {"usr": _auth_field(self.auth, "usr"),
+                "zysid": _auth_field(self.auth, "zysid"),
+                "p29": "zye5b814", "p2": "104583", "p3": "18070403",
+                "p4": "501603", "p33": "com.chaozh.iReaderFree"}
 
     # ---------- 搜索 ----------
 
@@ -1292,6 +2107,83 @@ def _folder_of(row: dict) -> str:
     return ""
 
 
+# 买完自动归夹的判定口径。状态/评价类文件夹不是按题材归类，不作为候选。
+AUTO_FOLDER_STATUS_WORDS = (
+    "已阅", "已读", "未读", "在读", "待读", "想读", "读完", "垃圾", "踩雷",
+    "本地导入", "导入", "临时", "待整理", "其他", "收藏", "书架",
+)
+AUTO_FOLDER_MIN_SCORE = 80
+AUTO_FOLDER_MIN_LEAD = 20
+
+
+def _book_series(name: str) -> str:
+    """书名里的系列前缀：去掉平台方括号后缀后，按常见分隔符取第一段。"""
+    s = re.sub(r"[\[(（【].*?[\])）】]", "", name or "").strip()
+    return re.split(r"[·:：\-—\s(（]", s)[0].strip()
+
+
+def choose_folder(book: dict, layout: dict) -> dict:
+    """为已购书挑一个最合适的自建文件夹；没有明确合适的返回 folder=""。
+
+    候选只取书架里存在节点的自建文件夹（shelf_layout 的 folders 中 id 非空），
+    不新建文件夹。信号取最高分，须 >= AUTO_FOLDER_MIN_SCORE 且领先第二名
+    >= AUTO_FOLDER_MIN_LEAD；分数并列视为不确定，一律不移动。
+      100  文件夹名出现在书名中，或文件夹名与作者相同
+       80  该文件夹里已有 >= 2 本书与目标书共享系列前缀
+    """
+    name = book.get("name") or ""
+    author = (book.get("author") or "").strip()
+    series = _book_series(name)
+    folders = [f["name"] for f in (layout.get("folders") or [])
+               if f.get("name") and f.get("id")]
+    books = layout.get("books") or []
+    if not folders:
+        return {"folder": "", "reason": "书架上没有自建文件夹",
+                "score": 0, "candidates": []}
+
+    scores: list[dict] = []
+    for folder in folders:
+        if any(w in folder for w in AUTO_FOLDER_STATUS_WORDS):
+            continue
+        score, why = 0, ""
+        if len(folder) >= 2 and folder in name:
+            score, why = 100, f"书名含「{folder}」"
+        elif author and folder == author:
+            score, why = 100, f"文件夹名与作者「{author}」相同"
+        elif len(series) >= 2:
+            same = [b for b in books
+                    if _folder_of(b) == folder
+                    and _book_series(b.get("book_name") or "") == series]
+            if len(same) >= 2:
+                score, why = 80, f"夹内已有 {len(same)} 本同系列书（{series}）"
+        if score:
+            scores.append({"folder": folder, "score": score, "reason": why})
+
+    if not scores:
+        return {"folder": "", "reason": "没有明确合适的文件夹",
+                "score": 0, "candidates": []}
+    scores.sort(key=lambda x: (-x["score"], x["folder"]))
+    best = scores[0]
+    second = scores[1]["score"] if len(scores) > 1 else 0
+    if best["score"] < AUTO_FOLDER_MIN_SCORE or best["score"] - second < AUTO_FOLDER_MIN_LEAD:
+        return {"folder": "", "reason": "匹配不够明确，保持未归类",
+                "score": best["score"], "candidates": scores}
+    return {"folder": best["folder"], "reason": best["reason"],
+            "score": best["score"], "candidates": scores}
+
+
+def auto_folder_decision(client, bid: str, name: str) -> dict:
+    """只读地取书架结构与书目，交给 choose_folder；异常时降级为不移动。"""
+    try:
+        layout = client.shelf_layout()
+        detail = client.detail(bid)
+        return choose_folder({"name": name or detail.get("name", ""),
+                              "author": detail.get("author", "")}, layout)
+    except Exception as exc:
+        return {"folder": "", "reason": f"读取书架或书目失败，跳过自动归夹（{exc}）",
+                "score": 0, "candidates": []}
+
+
 def _next_folder_order(items: list[dict]) -> int:
     """新建文件夹节点的 order：用 1000000 起的递增段，排在书后面。
 
@@ -1331,6 +2223,31 @@ def _interleave(cands: list[dict], top: int) -> list[dict]:
         if not progressed:
             break
     return out
+
+
+def _split_add_spec(spec: str) -> tuple[str, str]:
+    """拆 `blnew --add` 的 `BID[:理由]` 参数。
+
+    `ISBN:` 自带冒号，不能直接 `partition(":")`——否则 `ISBN:9787…:理由` 会被
+    切成 `ISBN` + `9787…:理由`。ISBN 条目跳过前 5 个字符再找分隔冒号。
+    """
+    s = spec.strip()
+    start = 5 if s.upper().startswith("ISBN:") else 0
+    i = s.find(":", start)
+    if i < 0:
+        return s, ""
+    return s[:i], s[i + 1:]
+
+
+def _bl_book_key(bid: str) -> str:
+    """把书单里的书目 id 归一化成可比较的 key。
+
+    数字 book_id 原样返回；`ISBN:xxx` 与 `xxx` 都归成 `xxx`——服务端在
+    `booklist_info` 的 books[].id 里会把 ISBN 条目的 `ISBN:` 前缀去掉，
+    直接按原始字符串比对会漏配。
+    """
+    s = str(bid).strip()
+    return s[5:] if s.upper().startswith("ISBN:") else s
 
 
 def normalize_title(name: str) -> str:
@@ -1484,6 +2401,17 @@ def main():
     p.add_argument("--top", type=int, default=600,
                    help="最多查价多少本（默认 600；--full 时忽略）")
 
+    p = sub.add_parser("taoshu", help="淘书市当期书目：叠加满减券后能买的书",
+                       parents=[_common])
+    p.add_argument("--limit", type=float, default=None,
+                   help="自付上限（默认=可用代金券总额）")
+    p.add_argument("--act", default="", help="指定活动 act_id（默认自动找滚动栏当期）")
+    p.add_argument("--status", default="2", help="0全部/1免费/2特价/3完结/4VIP")
+    p.add_argument("--top", type=int, default=200,
+                   help="最多查价多少本（默认 200，活动书目约 150 本）")
+    p.add_argument("--show-coupons", action="store_true", default=argparse.SUPPRESS,
+                   help="只列当期券面额与门槛，不查价推荐")
+
     p = sub.add_parser("recommend", help="按热度/好评推荐能买的书", parents=[_common])
     p.add_argument("--sort", default="download", choices=list(ORDERS),
                    help="download=热门(默认) / score=好评 / update=最新")
@@ -1512,6 +2440,74 @@ def main():
                        parents=[_common])
     p.add_argument("bid", help="book_id")
 
+    p = sub.add_parser("author", help="按任一作品查作者主页：简介 + 名下全部作品",
+                       parents=[_common])
+    p.add_argument("bid", help="该作者的任一 book_id")
+
+    p = sub.add_parser("blsearch", help="搜用户创建的书单（书单 tab 数据，可翻页）",
+                       parents=[_common])
+    p.add_argument("keyword", help="关键词（书名/作者/主题均可）")
+    p.add_argument("--page", type=int, default=1, metavar="N",
+                   help="书单第 N 页（每页 20 个；只返回书单，无作者卡/同页书籍）")
+    p.add_argument("--all", action="store_true",
+                   help="自动翻页拿全部书单（每页 50 个，上限 200 个）")
+
+    p = sub.add_parser("bsearch", help="书城搜书（App 搜索多栏接口，带评分/分类，可翻页）",
+                       parents=[_common])
+    p.add_argument("keyword", help="关键词（书名/作者/题材均可）")
+    p.add_argument("--page", type=int, default=1, metavar="N",
+                   help="书籍第 N 页（每页 20 本）")
+    p.add_argument("--all", action="store_true",
+                   help="自动翻页拿全部书籍（每页 50 本，上限 200 本）")
+
+    p = sub.add_parser("booklist", help="书单详情：书单内书列表",
+                       parents=[_common])
+    p.add_argument("blid", help="书单 id（blsearch 结果里的 id）")
+    p.add_argument("--sale", action="store_true",
+                   help="只显示在售书（剔除 is_removed=true 的下架书）")
+
+    p = sub.add_parser("mybl", help="我的书单列表（我创建的 / 我收藏的，只读）",
+                       parents=[_common])
+    p.add_argument("--fav", action="store_true", help="看我收藏的书单（默认看我创建的）")
+    p.add_argument("--books", action="store_true", help="同时列出每个书单里的书")
+
+    p = sub.add_parser("blnew", help="创建书单（⚠️ 写操作）", parents=[_common])
+    p.add_argument("name", help="书单名称（1~40 字）")
+    p.add_argument("--desc", required=True, help="书单描述（1~200 字，必填）")
+    p.add_argument("--qiu", action="store_true", help="建成「求书单」（默认晒书单）")
+    p.add_argument("--add", action="append", default=[], metavar="BID[:理由]",
+                   help="建单时顺带加书，可重复：--add 10881716:很好看")
+
+    p = sub.add_parser("bledit", help="改书单名称/描述（⚠️ 写操作）", parents=[_common])
+    p.add_argument("blid", help="书单 id")
+    p.add_argument("--name", default=None, help="新名称（不改就省略）")
+    p.add_argument("--desc", default=None, help="新描述（不改就省略）")
+
+    p = sub.add_parser("bladd", help="往书单加书（⚠️ 写操作）", parents=[_common])
+    p.add_argument("blid", help="书单 id")
+    p.add_argument("bids", nargs="+", help="book_id 或 ISBN:xxx")
+    p.add_argument("--reason", default="", help="给这些书统一写一句推荐理由")
+    p.add_argument("--dry", action="store_true", help="只预览要加什么，不写入")
+
+    p = sub.add_parser("blrm", help="把书移出书单（⚠️ 写操作，默认预览）",
+                       parents=[_common])
+    p.add_argument("blid", help="书单 id")
+    p.add_argument("bids", nargs="+", help="book_id")
+    p.add_argument("--yes", action="store_true", help="真正移除；不加则只预览")
+
+    p = sub.add_parser("bldel", help="删除书单（⚠️ 写操作，默认预览）", parents=[_common])
+    p.add_argument("blid", nargs="+", help="书单 id，可给多个")
+    p.add_argument("--yes", action="store_true", help="真正删除；不加则只预览")
+
+    p = sub.add_parser("blfav", help="收藏/取消收藏别人的书单（⚠️ 写操作）",
+                       parents=[_common])
+    p.add_argument("blid", help="书单 id")
+    p.add_argument("--off", action="store_true", help="取消收藏")
+
+    p = sub.add_parser("blsuggest", help="书单加书时的联想搜索（只读）",
+                       parents=[_common])
+    p.add_argument("keyword", help="书名或作者关键词")
+
     p = sub.add_parser("categories", help="列出所有分类（可用 name）", parents=[_common])
     p.add_argument("--channel", default="92", help="频道，默认 92=出版")
 
@@ -1526,6 +2522,8 @@ def main():
                    help="下单成功后不自动加入云书架")
     p.add_argument("--folder", default="",
                    help="买完加书架时直接放进这个文件夹（不存在会自动建）")
+    p.add_argument("--no-auto-folder", action="store_true",
+                   help="买完不自动归到书架文件夹（默认自动挑选已存在的自建文件夹）")
     p.add_argument("--ignore-coupon", action="store_true",
                    help="确认不用满减券：按活动价全额用代金券支付")
 
@@ -1560,6 +2558,24 @@ def main():
     p.add_argument("--force", action="store_true",
                    help="文件夹里还有书时，先把书移出到未归类再删（不丢书）")
     p.add_argument("--dry", action="store_true", help="只预览，不写入")
+
+    p = sub.add_parser("cart", help="查看购物车（新版，含下架/失效标记，只读）",
+                       parents=[_common])
+    p.add_argument("--recd", action="store_true",
+                   help="同时列出基于购物车的推荐书目")
+
+    p = sub.add_parser("cartdel", help="从购物车删除书目（⚠️ 写操作，默认预览）",
+                       parents=[_common])
+    p.add_argument("bids", nargs="+", help="book_id，可给多个")
+    p.add_argument("--category", type=int, default=1,
+                   help="bookCategory（出版书籍=1，默认 1）")
+    p.add_argument("--yes", action="store_true", help="真正删除；不加则只预览")
+
+    p = sub.add_parser("cartadd", help="加入购物车（⚠️ 契约已破解，服务端暂拒，见文档）",
+                       parents=[_common])
+    p.add_argument("bid", help="book_id")
+    p.add_argument("--category", type=int, default=1,
+                   help="bookCategory（出版书籍=1，默认 1）")
 
     a = ap.parse_args()
     if not a.cmd:
@@ -1749,6 +2765,20 @@ def main():
             print("\n[中止] 未取到下单令牌", file=sys.stderr)
             sys.exit(1)
 
+        # 买完归夹：下单前判定一次，询价与确认下单共用同一决定。
+        # 显式 --folder 优先；--no-shelf / --no-auto-folder 时不判定。
+        decision = None
+        if a.folder:
+            decision = {"folder": a.folder, "reason": "命令行 --folder 指定"}
+        elif not a.no_shelf and not a.no_auto_folder:
+            decision = auto_folder_decision(
+                c, a.bid, re.sub(r"^《|》$", "", title).strip())
+        if decision is not None:
+            dest = decision["folder"]
+            print("买完归夹    " + (
+                f"将归入「{dest}」（{decision['reason']}）" if dest
+                else f"不移动：{decision['reason']}"))
+
         if not a.confirm:
             print(f"\n[dry-run] 仅询价，未下单。确认无误后加 --confirm 再跑一次。")
             print(f"        python picker.py buy {a.bid} --confirm")
@@ -1776,13 +2806,27 @@ def main():
             return
         name = q2["name"] or c.detail(a.bid).get("name") or f"book {a.bid}"
         name = re.sub(r"^《|》$", "", name).strip() or name
-        sr = c.shelf_add(a.bid, name, folder=a.folder)
+        folder = decision["folder"] if decision else ""
+        if folder and not a.folder:
+            # 自动归夹只认下单前已存在的自建文件夹；夹若已被删就保持未归类，
+            # 不能让 shelf_add 把它重新建出来。
+            try:
+                alive = {_folder_of(it) for it in c.shelf_tree()[0]
+                         if it.get("dtype") == 1}
+                if folder not in alive:
+                    print(f"自动归夹    跳过：文件夹「{folder}」已不存在，保持未归类")
+                    folder = ""
+            except Exception:
+                folder = ""
+        sr = c.shelf_add(a.bid, name, folder=folder)
         if sr.get("code") == 0:
             rows, _ = c._shelf_rows()
             on = a.bid in {str(x.get("book_id")) for x in rows}
-            dest = f"（已归入「{a.folder}」）" if a.folder else ""
+            dest = f"（已归入「{folder}」）" if folder else ""
             print(f"加入云书架：{sr.get('before_total', '?')} → {len(rows)} 本  "
                   f"{'✅ 已加入' if on else '⚠️ 复核未在书架'}{dest}")
+            if folder and not a.folder and decision:
+                print(f"自动归夹    ✅ 已归入「{folder}」：{decision['reason']}")
         else:
             print(f"⚠️ 加书架失败（书已购买）："
                   f"{json.dumps(sr, ensure_ascii=False)[:150]}\n"
@@ -1902,6 +2946,108 @@ def main():
             print(f"✅ 已删除文件夹「{a.folder}」{extra}")
         return
 
+    # ---------------- cart（购物车，只读） ----------------
+    if a.cmd == "cart":
+        auth = need_auth(auth)
+        c = Client(auth, workers=a.workers)
+        data = c.cart_list()
+        total = sum(len(g["books"]) for g in data["groups"])
+        if a.json:
+            print(json.dumps(data, ensure_ascii=False, indent=1))
+            return
+        if not total:
+            print("购物车是空的。")
+        else:
+            state_txt = {0: "", 1: "免费", 2: "下架", 3: "失效"}
+            print(f"购物车 {total} 本（上限 {data['limit']}）\n")
+            for g in data["groups"]:
+                tn = g["type_name"] or f"分类{g['type']}"
+                print(f"【{tn}】{len(g['books'])} 本")
+                for b in g["books"]:
+                    st = state_txt.get(b.get("state", 0), f"state={b.get('state')}")
+                    mark = f"  「{st}」" if st else ""
+                    sel = "☑" if b.get("selectStatus") else "☐"
+                    print(f"  {sel} [{b['bookId']}] 《{b['bookName']}》{mark}")
+                    print(f"        {b.get('author', '')}  {b.get('priceDesc', '')}"
+                          + (f"  {b['buyDesc']}" if b.get("buyDesc") else ""))
+            dead = [b for g in data["groups"] for b in g["books"]
+                    if b.get("state") not in (0, 1)]
+            if dead:
+                print(f"\n⚠️  {len(dead)} 本下架/失效（不支持结算）："
+                      + "、".join(f"《{b['bookName']}》" for b in dead))
+                print("    留着不影响其他书结算；要清掉可用 cartdel。")
+        if a.recd:
+            rows = c.cart_recd()
+            if rows:
+                print(f"\n基于购物车的推荐 {len(rows)} 本：")
+                for b in rows:
+                    print(f"  [{b['bookId']}] 《{b['bookName']}》")
+        return
+
+    # ---------------- cartdel（写操作，默认预览） ----------------
+    if a.cmd == "cartdel":
+        auth = need_auth(auth)
+        c = Client(auth, workers=a.workers)
+        data = c.cart_list()
+        in_cart = {str(b["bookId"]): b for g in data["groups"] for b in g["books"]}
+        known = [(str(bid), in_cart[str(bid)]) for bid in a.bids
+                 if str(bid) in in_cart]
+        unknown = [str(bid) for bid in a.bids if str(bid) not in in_cart]
+        if a.json:
+            print(json.dumps({"will_delete": [b for _, b in known],
+                              "not_in_cart": unknown, "confirmed": bool(a.yes)},
+                             ensure_ascii=False, indent=1))
+            return
+        print(f"将删除 {len(known)} 本：")
+        for bid, b in known:
+            print(f"  [{bid}] 《{b['bookName']}》")
+        for bid in unknown:
+            print(f"  [{bid}]（不在购物车里，跳过）")
+        if not known:
+            return
+        if not a.yes:
+            print("\n预览完毕；确认无误请加 --yes 执行删除。")
+            return
+        r = c.cart_del([bid for bid, _ in known], category=a.category)
+        data2 = c.cart_list()
+        in_cart2 = {str(b["bookId"]) for g in data2["groups"] for b in g["books"]}
+        gone = [bid for bid, _ in known if bid not in in_cart2]
+        print(f"\n✅ 已删除 {len(gone)}/{len(known)} 本，购物车现有 "
+              f"{len(in_cart2)} 本（上限 {data2['limit']}）")
+        left = [bid for bid, _ in known if bid in in_cart2]
+        if left:
+            print(f"⚠️  仍在购物车：{'、'.join(left)}（服务端可能未生效，如实上报）")
+        return
+
+    # ---------------- cartadd（写操作） ----------------
+    if a.cmd == "cartadd":
+        auth = need_auth(auth)
+        c = Client(auth, workers=a.workers)
+        name = ""
+        try:
+            name = c.detail(a.bid).get("name") or ""
+        except Exception:
+            pass
+        print(f"加入购物车：[{a.bid}] 《{name}》（bookCategory={a.category}）",
+              flush=True)
+        try:
+            r = c.cart_add(a.bid, category=a.category)
+        except RuntimeError as e:
+            if "code=201" in str(e):
+                print("《%s》已在购物车，无需重复添加" % (name or a.bid))
+                return
+            print(f"[失败] {e}", file=sys.stderr)
+            if "53002" in str(e):
+                print("说明：加购要求请求带非空 p1/p3 设备参数（已内置）；"
+                      "若仍报错见 references/api.md 10b 节。", file=sys.stderr)
+            sys.exit(1)
+        print(f"✅ 服务端返回：{json.dumps(r, ensure_ascii=False)[:200]}")
+        data = c.cart_list()
+        in_cart = {str(b["bookId"]) for g in data["groups"] for b in g["books"]}
+        print(f"购物车现有 {len(in_cart)} 本，"
+              f"{'✅ 已在购物车' if str(a.bid) in in_cart else '⚠️ 复核未在购物车'}")
+        return
+
     # ---------------- shelf（写操作） ----------------
     if a.cmd == "shelf":
         auth = need_auth(auth)
@@ -1986,6 +3132,552 @@ def main():
                      else "  ✅ 券够，可 0 元买下"))
         return
 
+    # ---------------- author（只读：作者主页） ----------------
+    if a.cmd == "author":
+        r = c.author_page(a.bid)
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=1))
+            return
+        if not r.get("ok"):
+            print("[失败] " + r.get("msg", ""), file=sys.stderr)
+            sys.exit(1)
+        print(f"=== 作者主页 ===（入口：《{r['source_book_name']}》 {r['source_book']}）")
+        print(f"作者   {r['name']}"
+              + (f"（{r['utag']}）" if r.get("utag") else "")
+              + f"   入口署名：{r['role']}")
+        if r.get("intro"):
+            body = r["intro"]
+            print("简介   " + (body if len(body) <= 300
+                              else body[:300] + "…（--json 看全文）"))
+        extra = []
+        if r.get("all_books_label"):
+            extra.append(r["all_books_label"])
+        if r.get("total_words"):
+            extra.append(r["total_words"])
+        print(f"作品   共 {r['total_books']} 本"
+              + ("（" + "，".join(extra) + "）" if extra else ""))
+        priced = c.price_many([w["bid"] for w in r["works"]])
+        for i, w in enumerate(r["works"], 1):
+            d = priced.get(w["bid"]) or {}
+            if d.get("price") is not None:
+                ps = f"{d['price']:>6.0f} 阅饼"
+            elif d.get("free"):
+                ps = "  免费"
+            else:
+                ps = "  无整本价"
+            print(f"  {i:>2}. {w['bid']:<10} {ps}  {w['name'].strip()[:36]}")
+        return
+
+    # ---------------- blsearch（只读：书单搜索） ----------------
+    if a.cmd == "blsearch":
+        if getattr(a, "all", False):
+            r = c.search_booklist_all(a.keyword)
+        elif a.page > 1:
+            r = c.search_booklist(a.keyword, page=a.page, page_size=20,
+                                  paginated=True)
+        else:
+            r = c.search_booklist(a.keyword)
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=1))
+            return
+        if not r.get("ok"):
+            print("[失败] 搜索接口无返回或格式异常", file=sys.stderr)
+            sys.exit(1)
+        bls = r.get("booklists") or []
+        pg = r.get("bk_page") or {}
+        mode = r.get("mode") or ""
+        if pg and mode == "all":
+            print(f"=== 书单搜索「{a.keyword}」=== 共 {pg.get('totalRecord', '?')} 个书单，"
+                  f"已抓取 {len(bls)} 个")
+        elif pg and mode.startswith("page:"):
+            print(f"=== 书单搜索「{a.keyword}」=== 第 {pg.get('currentPage', '?')}"
+                  f"/{pg.get('totalPage', '?')} 页，共 {pg.get('totalRecord', '?')} 个书单"
+                  f"（本页 {len(bls)} 个）")
+        elif pg:
+            print(f"=== 书单搜索「{a.keyword}」=== 共 {pg.get('totalRecord', '?')} 个书单"
+                  f"（首屏 {len(bls)} 个；--page 翻页 / --all 拿全部）")
+        else:
+            print(f"=== 书单搜索「{a.keyword}」===")
+        if r.get("author_card"):
+            ac = r["author_card"]
+            body = ac.get("synopsis") or ""
+            print(f"◆ 作者卡  {ac.get('authorName')}")
+            print("    " + (body[:180] + "…（--json 看全文）" if len(body) > 180 else body))
+        for b in bls:
+            tags = "/".join(b.get("tags") or [])
+            print(f"◆ {b.get('id')}  {b.get('name')}")
+            meta = []
+            if b.get("count") is not None:
+                meta.append(f"含书 {b['count']} 本")
+            if b.get("fav_num") is not None:
+                meta.append(f"收藏 {b['fav_num']}")
+            if b.get("like") is not None:
+                meta.append(f"点赞 {b['like']}")
+            if b.get("user_nick"):
+                meta.append(f"创建人 {b['user_nick']}")
+            if meta:
+                print("    " + " · ".join(meta))
+            if tags:
+                print(f"    标签：{tags}")
+            desc = b.get("description") or ""
+            if desc:
+                print("    " + (desc[:160] + "…（--json 看全文）" if len(desc) > 160 else desc))
+            print(f"    详情：python picker.py booklist {b.get('id')}")
+        if r.get("books"):
+            print(f"--- 同页书籍 {len(r['books'])} 本 ---")
+            for b in r["books"]:
+                rt = f"{b['rating']:.1f}分" if b.get("rating") is not None else "—"
+                print(f"    {b.get('bid')}  {b.get('name')}  {b.get('author')}  {rt}")
+        if r.get("related"):
+            print("相关搜索：" + " / ".join(r["related"][:6]))
+        return
+
+    # ---------------- bsearch（只读：书城搜书，App 多栏接口书籍 tab） ----------------
+    if a.cmd == "bsearch":
+        if getattr(a, "all", False):
+            r = c.search_book_all(a.keyword)
+        elif a.page > 1:
+            r = c.search_book(a.keyword, page=a.page, page_size=20)
+        else:
+            r = c.search_book(a.keyword)
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=1))
+            return
+        if not r.get("ok"):
+            print("[失败] 搜索接口无返回或格式异常", file=sys.stderr)
+            sys.exit(1)
+        bks = r.get("books") or []
+        pg = r.get("book_page") or {}
+        mode = r.get("mode") or ""
+        if pg and mode == "all":
+            print(f"=== 书籍搜索「{a.keyword}」=== 共 {pg.get('totalRecord', '?')} 本，"
+                  f"已抓取 {len(bks)} 本")
+        elif pg and mode.startswith("page:"):
+            print(f"=== 书籍搜索「{a.keyword}」=== 第 {pg.get('currentPage', '?')}"
+                  f"/{pg.get('totalPage', '?')} 页，共 {pg.get('totalRecord', '?')} 本"
+                  f"（本页 {len(bks)} 本）")
+        else:
+            print(f"=== 书籍搜索「{a.keyword}」=== 共 {pg.get('totalRecord', '?')} 本"
+                  f"（本页 {len(bks)} 本；--page 翻页 / --all 拿全部）")
+        if not bks and mode.startswith("page:"):
+            print("（本页无结果——页码超出总页数）")
+            return
+        for b in bks:
+            rt = f"{b['rating']:.1f}分" if b.get("rating") is not None else "—"
+            comp = "已完结" if str(b.get("complete")).upper() == "Y" else "连载中"
+            cat = b.get("category") or ""
+            meta = " · ".join(x for x in (rt, cat, comp) if x)
+            print(f"◆ {b.get('bid')}  {b.get('name')}  {b.get('author')}  {meta}")
+            print(f"    详情：python picker.py info {b.get('bid')}")
+        return
+
+    # ---------------- booklist（只读：书单详情） ----------------
+    if a.cmd == "booklist":
+        # 优先走原生接口：一次拿全书目（每页 10 本、自动翻页），比 H5 只能取前 5 本强
+        native = None
+        try:
+            native = c.booklist_info(a.blid)
+        except RuntimeError as e:
+            print(f"（原生接口不可用，退回 H5 页：{e}）", file=sys.stderr)
+        if native:
+            if a.json:
+                print(json.dumps(native, ensure_ascii=False, indent=1))
+                return
+            u = native.get("user") or {}
+            print(f"=== 书单 {a.blid}  {native.get('name') or ''} ===")
+            meta = []
+            if native.get("count") is not None:
+                meta.append(f"含书 {native['count']} 本")
+            if native.get("favNum"):
+                meta.append(f"收藏 {native['favNum']}")
+            if u.get("name") or native.get("user_nick"):
+                meta.append(f"创建人 {u.get('name') or native.get('user_nick')}")
+            if native.get("updateTime"):
+                meta.append(f"更新 {native['updateTime']}")
+            if native.get("isPublic"):
+                meta.append("公开" if native["isPublic"] == "public" else native["isPublic"])
+            if meta:
+                print(" · ".join(meta))
+            if native.get("desc"):
+                d = native["desc"]
+                print("描述   " + (d[:200] + "…（--json 看全文）" if len(d) > 200 else d))
+            if native.get("tags"):
+                print("标签   " + "/".join(native["tags"]))
+            books = native.get("books") or []
+            removed_n = sum(1 for b in books if b.get("is_removed"))
+            # --sale 只看在售；H5 回退路径没有 is_removed 字段，不过滤
+            shown = [b for b in books if not b.get("is_removed")] if a.sale else books
+            head = f"书目 {len(shown)} 本"
+            if a.sale:
+                head += f"（已剔除下架 {removed_n} 本）" if removed_n else "（均在售）"
+            elif removed_n:
+                head += f"（其中已下架 {removed_n} 本，标 [已下架]）"
+            print(head)
+            for i, b in enumerate(shown, 1):
+                rt = f"{b['bookRating']}分" if b.get("bookRating") else ""
+                dead = "  [已下架]" if b.get("is_removed") else ""
+                print(f"  {i:>2}. {b.get('id'):<12} {b.get('name')}  "
+                      f"{b.get('author') or ''}  {rt}{dead}".rstrip())
+                if b.get("book_desc"):
+                    print(f"      理由：{b['book_desc'][:120]}")
+            return
+        r = c.booklist_detail(a.blid)
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=1))
+            return
+        if not r.get("ok"):
+            print("[失败] 书单详情页无返回", file=sys.stderr)
+            sys.exit(1)
+        if a.sale:
+            print("（H5 回退路径无下架标记，--sale 未生效）", file=sys.stderr)
+        print(f"=== 书单 {a.blid} ==="
+              + (f"  点赞 {r['like']}" if r.get("like") is not None else ""))
+        if r.get("description"):
+            d = r["description"]
+            print("描述   " + (d[:200] + "…（--json 看全文）" if len(d) > 200 else d))
+        books = r.get("books") or []
+        tp = r.get("total_pages")
+        print(f"书列表 {len(books)} 本"
+              + (f"（H5 共 {tp} 页，每页 5 本；更多书的翻页接口未公开，仅能取到第一屏）"
+                 if tp and tp > 1 else ""))
+        for i, b in enumerate(books, 1):
+            print(f"  {i:>2}. {b.get('bid'):<10} {b.get('name')}  {b.get('author')}")
+            if b.get("reason"):
+                print(f"      理由：{b['reason'][:120]}")
+        return
+
+    # ---------------- 我的书单（原生接口） ----------------
+
+    def _fmt_booklist_head(d: dict, i: int = 0) -> None:
+        """打印一条书单的概要（mybl / bldel 预览共用）。"""
+        tags = "/".join(d.get("tags") or [])
+        cnt = d.get("count")
+        meta = []
+        if cnt is not None:
+            meta.append(f"含书 {cnt} 本")
+        if d.get("fav_num"):
+            meta.append(f"收藏 {d['fav_num']}")
+        if d.get("like"):
+            meta.append(f"点赞 {d['like']}")
+        if d.get("is_public") and d["is_public"] != "public":
+            meta.append(d["is_public"])
+        if d.get("update_time"):
+            meta.append(f"更新 {d['update_time']}")
+        prefix = f"{i:>2}. " if i else ""
+        print(f"{prefix}{d.get('id')}  {d.get('name')}"
+              + ("   " + " · ".join(meta) if meta else ""))
+        if tags:
+            print(f"    标签：{tags}")
+        desc = d.get("description") or ""
+        if desc:
+            print("    " + (desc[:160] + "…（--json 看全文）" if len(desc) > 160 else desc))
+
+    if a.cmd == "mybl":
+        r = c.my_booklists("2" if a.fav else "1")
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=1))
+            return
+        kind = "我收藏的书单" if a.fav else "我创建的书单"
+        print(f"=== {kind} === 共 {r['total']} 个")
+        lists = r.get("lists") or []
+        if not lists:
+            print("（还没有书单）" if not a.fav
+                  else "（还没收藏别人的书单，用 blfav <书单id> 收藏）")
+            return
+        for d in lists:
+            _fmt_booklist_head(d)
+            if a.books:
+                # myList 里的 books 只是预览（通常只回 1 本，且 description 不是推荐理由），
+                # 要列全书目得单独打 info 接口
+                try:
+                    full = c.booklist_info(d.get("id"))
+                    bl = full.get("books") or []
+                except RuntimeError as e:
+                    print(f"      （书目读取失败：{e}）", file=sys.stderr)
+                    bl = d.get("books") or []
+                for j, bk in enumerate(bl, 1):
+                    reason = (bk.get("book_desc") or "").strip()
+                    print(f"      {j}. {bk.get('id')}  {bk.get('name')}"
+                          + (f"  理由：{reason[:60]}" if reason else ""))
+            print(f"    详情：python scripts/picker.py booklist {d.get('id')}")
+        return
+
+    if a.cmd == "blsuggest":
+        rows = c.booklist_suggest(a.keyword)
+        if a.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=1))
+            return
+        if not rows:
+            print(f"「{a.keyword}」没有联想结果", file=sys.stderr)
+            return
+        print(f"=== 联想「{a.keyword}」 === 共 {len(rows)} 条")
+        for i, r0 in enumerate(rows, 1):
+            kind = "在售" if str(r0.get("type")) == "1" else "ISBN(豆瓣)"
+            print(f"  {i:>2}. {r0.get('id'):<18} {kind:<10} {r0.get('name')}"
+                  f"  {r0.get('author') or ''}")
+        print("\n加书：python scripts/picker.py bladd <书单id> <上面第一列的 id>")
+        return
+
+    if a.cmd == "blnew":
+        # 服务端对名称/描述长度与敏感词统一返回 31215，本地先挡明显超限的
+        if not a.name.strip():
+            print("⚠️  书单名称不能为空", file=sys.stderr)
+            sys.exit(2)
+        if len(a.name) > 40:
+            print(f"⚠️  书单名称最长 40 字（当前 {len(a.name)} 字）", file=sys.stderr)
+            sys.exit(2)
+        if len(a.desc) > 200:
+            print(f"⚠️  书单描述最长 200 字（当前 {len(a.desc)} 字）", file=sys.stderr)
+            sys.exit(2)
+        # 建单时的 addBooks 服务端解析不过（空 id 触发 int('')），所以先建空单再加书
+        try:
+            r = c.booklist_create(a.name, a.desc,
+                                  book_type="2" if a.qiu else "1")
+        except RuntimeError as e:
+            msg = str(e)
+            if "31215" in msg:
+                msg += ("（多为名称/描述超长或含敏感词：名称 1~40 字、"
+                        "描述 1~200 字，且不能出现违规词）")
+            print(f"[失败] {msg}", file=sys.stderr)
+            sys.exit(1)
+        added, failed = [], []
+        for spec in a.add or []:
+            bid, reason = _split_add_spec(spec)
+            bid = bid.strip()
+            if not bid:
+                continue
+            is_isbn = bid.upper().startswith("ISBN:")
+            plain = bid[5:] if is_isbn else bid
+            name = author = pic = ""
+            try:
+                d = c.detail(plain) if not is_isbn else {}
+                name, author = d.get("name") or "", d.get("author") or ""
+                pic = d.get("cover") or ""
+            except Exception:  # noqa: BLE001
+                pass
+            if not name:
+                for cand in c.booklist_suggest(plain) or []:
+                    if str(cand.get("id")) == bid:
+                        name = cand.get("name") or ""
+                        author = cand.get("author") or ""
+                        pic = cand.get("pic") or ""
+                        break
+            try:
+                c.booklist_add_book(r["id"], bid, name=name, author=author,
+                                    desc=reason.strip(), pic=pic, is_isbn=is_isbn)
+                added.append({"bid": bid, "name": name})
+            except RuntimeError as e:
+                failed.append((bid, str(e)))
+        if added:
+            try:
+                have = {_bl_book_key(b.get("id")): b
+                        for b in (c.booklist_info(r["id"]).get("books") or [])}
+                for x in added:
+                    bk = have.get(_bl_book_key(x["bid"]))
+                    if bk and not x["name"]:
+                        x["name"] = bk.get("name") or ""
+            except RuntimeError:
+                pass
+        if a.json:
+            print(json.dumps({**r, "added": added,
+                              "failed": [{"bid": b, "error": m} for b, m in failed]},
+                             ensure_ascii=False, indent=1))
+            return
+        kind = "求书单" if a.qiu else "晒书单"
+        print(f"✅ 已创建{kind} {r['id']}  {r['name']}")
+        if added:
+            print(f"   建单时带入了 {len(added)} 本书：")
+            for x in added:
+                print(f"     {x['bid']:<18} {x['name']}")
+        for b, m in failed:
+            print(f"⚠️  {b} 未加入：{m}", file=sys.stderr)
+        print(f"   详情：python scripts/picker.py booklist {r['id']}")
+        print(f"   加书：python scripts/picker.py bladd {r['id']} <book_id>")
+        return
+
+    if a.cmd == "bledit":
+        if a.name is None and a.desc is None:
+            print("⚠️  至少要给 --name 或 --desc 之一", file=sys.stderr)
+            sys.exit(2)
+        if a.name is not None and (not a.name.strip() or len(a.name) > 40):
+            print(f"⚠️  书单名称需 1~40 字（当前 {len(a.name)} 字）", file=sys.stderr)
+            sys.exit(2)
+        if a.desc is not None and len(a.desc) > 200:
+            print(f"⚠️  书单描述最长 200 字（当前 {len(a.desc)} 字）", file=sys.stderr)
+            sys.exit(2)
+        cur = c.booklist_info(a.blid)
+        name = a.name if a.name is not None else (cur.get("name") or "")
+        desc = a.desc if a.desc is not None else (cur.get("desc") or "")
+        try:
+            r = c.booklist_update(a.blid, name, desc)
+        except RuntimeError as e:
+            msg = str(e)
+            if "31215" in msg:
+                msg += "（名称/描述超长或含敏感词）"
+            print(f"[失败] {msg}", file=sys.stderr)
+            sys.exit(1)
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=1))
+            return
+        print(f"✅ 已保存书单 {a.blid}  {r['name']}")
+        if a.name is not None:
+            print(f"   名称：{cur.get('name')} → {name}")
+        if a.desc is not None:
+            old = (cur.get("desc") or "")[:40]
+            print(f"   描述：{old}… → {desc[:40]}")
+        print("   注意：服务端会在保存后把书单置为审核态，并把自动生成的标签清空；"
+              "标签由书目分类重算，通常要等审核结束或重新加书才会回来。")
+        return
+
+    if a.cmd == "bladd":
+        targets = []
+        for bid in a.bids:
+            is_isbn = bid.upper().startswith("ISBN:")
+            plain = bid[5:] if is_isbn else bid
+            meta = {"name": "", "author": "", "pic": ""}
+            if not is_isbn:
+                try:
+                    d = c.detail(plain)
+                    meta = {"name": d.get("name") or "", "author": d.get("author") or "",
+                            "pic": d.get("cover") or ""}
+                except Exception:  # noqa: BLE001 - 书目抓取失败不该挡住加书
+                    pass
+            if not meta["name"]:
+                # 详情页取不到（下架/仅试读）或 ISBN 书：退回联想接口补书名/作者
+                for cand in c.booklist_suggest(plain) or []:
+                    if str(cand.get("id")) == bid:
+                        meta = {"name": cand.get("name") or "",
+                                "author": cand.get("author") or "",
+                                "pic": cand.get("pic") or ""}
+                        break
+            targets.append({"bid": bid, "is_isbn": is_isbn, **meta})
+        if a.dry:
+            print(f"（预览）将往书单 {a.blid} 加 {len(targets)} 本：")
+            for t in targets:
+                print(f"  {t['bid']:<18} {t['name'] or '(书名待补)'}"
+                      f"  {t['author'] or ''}".rstrip())
+            if a.reason:
+                print(f"  推荐理由统一写：{a.reason}")
+            print("去掉 --dry 才会真正写入。")
+            return
+        ok, fail = [], []
+        for t in targets:
+            try:
+                c.booklist_add_book(a.blid, t["bid"], name=t["name"],
+                                    author=t["author"], desc=a.reason,
+                                    pic=t["pic"], is_isbn=t["is_isbn"])
+                ok.append(t)
+            except RuntimeError as e:
+                fail.append((t, str(e)))
+        if ok:
+            # 加完后回读一次，用服务端解析出的书名/作者覆盖（详情页抓不到的靠这里补）。
+            # 书单刚加过书会进入审核态（status=check），这时 info 读不到，跳过即可。
+            try:
+                have = {_bl_book_key(b.get("id")): b
+                        for b in (c.booklist_info(a.blid).get("books") or [])}
+                for t in ok:
+                    bk = have.get(_bl_book_key(t["bid"]))
+                    if bk:
+                        t["name"] = bk.get("name") or t["name"]
+                        t["author"] = bk.get("author") or t["author"]
+            except RuntimeError:
+                pass
+        if a.json:
+            print(json.dumps({"id": a.blid, "added": [t["bid"] for t in ok],
+                              "failed": [{"bid": t["bid"], "error": m}
+                                         for t, m in fail]},
+                             ensure_ascii=False, indent=1))
+            return
+        if ok:
+            print(f"✅ 已加入 {len(ok)} 本到书单 {a.blid}")
+            for t in ok:
+                print(f"   {t['bid']:<18} {t['name'] or ''}")
+        for t, m in fail:
+            print(f"⚠️  {t['bid']} 未加入：{m}", file=sys.stderr)
+        if fail and not ok:
+            sys.exit(1)
+        print(f"   看书单：python scripts/picker.py booklist {a.blid}")
+        return
+
+    if a.cmd == "blrm":
+        cur = c.booklist_info(a.blid)
+        have = {_bl_book_key(b.get("id")): b for b in (cur.get("books") or [])}
+        todo = [b for b in a.bids if _bl_book_key(b) in have]
+        missing = [b for b in a.bids if _bl_book_key(b) not in have]
+        for b in missing:
+            print(f"⚠️  {b} 不在书单 {a.blid} 里，跳过", file=sys.stderr)
+        if not todo:
+            print("没有可移除的书。", file=sys.stderr)
+            sys.exit(1)
+        if not a.yes:
+            print(f"（预览）将从书单 {a.blid}「{cur.get('name')}」移除 {len(todo)} 本：")
+            for b in todo:
+                bk = have[_bl_book_key(b)]
+                print(f"  {b:<12} {bk.get('name')}")
+            print("加 --yes 才真正移除。")
+            return
+        try:
+            r = c.booklist_remove_book(a.blid, todo)
+        except RuntimeError as e:
+            print(f"[失败] {e}", file=sys.stderr)
+            sys.exit(1)
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=1))
+            return
+        print(f"✅ 已从书单 {a.blid} 移除 {len(r['removed'])} 本")
+        return
+
+    if a.cmd == "bldel":
+        rows = []
+        for blid in a.blid:
+            try:
+                d = c.booklist_info(blid)
+                rows.append({"id": blid, "name": d.get("name"),
+                             "count": d.get("count")})
+            except RuntimeError as e:
+                print(f"⚠️  书单 {blid} 读不到：{e}", file=sys.stderr)
+                rows.append({"id": blid, "name": "(未知)", "count": None})
+        if not a.yes:
+            print("（预览）将删除以下书单：")
+            for d in rows:
+                print(f"  {d['id']}  {d['name']}"
+                      + (f"  含书 {d['count']} 本" if d.get("count") is not None else ""))
+            print("⚠️  删书单不可恢复（书单里的书本身不会被删）。加 --yes 才执行。")
+            return
+        done, fail = [], []
+        for d in rows:
+            try:
+                c.booklist_delete(d["id"])
+                done.append(d)
+            except RuntimeError as e:
+                fail.append((d, str(e)))
+        if a.json:
+            print(json.dumps({"deleted": [d["id"] for d in done],
+                              "failed": [{"id": d["id"], "error": m}
+                                         for d, m in fail]},
+                             ensure_ascii=False, indent=1))
+            return
+        for d in done:
+            print(f"✅ 已删除 {d['id']}  {d['name']}")
+        for d, m in fail:
+            print(f"⚠️  {d['id']} 删除失败：{m}", file=sys.stderr)
+        if fail:
+            sys.exit(1)
+        return
+
+    if a.cmd == "blfav":
+        try:
+            r = c.booklist_favorite(a.blid, add=not a.off)
+        except RuntimeError as e:
+            print(f"[失败] {e}", file=sys.stderr)
+            sys.exit(1)
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=1))
+            return
+        print(f"✅ 已{'取消收藏' if a.off else '收藏'}书单 {a.blid}")
+        print("   查看：python scripts/picker.py mybl --fav")
+        return
+
     # ---------------- categories ----------------
     if a.cmd == "categories":
         cats = c.categories(a.channel)
@@ -1994,7 +3686,7 @@ def main():
             print(f"  {nm:<8} cid={cid}")
         return
 
-    # ---------------- 求可用券额（afford/recommend/category/search 共用） ----------------
+    # ---------------- 求可用券额（afford/recommend/category/search/taoshu 共用） ----------------
     _vtotal: list[float | None] = [None]
 
     def real_vouchers() -> float | None:
@@ -2020,6 +3712,136 @@ def main():
                   "\n   想看「零付能买啥」，请提供凭证或显式 --limit。", file=sys.stderr)
             return 100.0
         return total if total > 0 else 100.0
+
+    # ---------------- taoshu（淘书市当期书目 × 叠加满减券推荐） ----------------
+    if a.cmd == "taoshu":
+        # ① 找当期活动（未换期时安静退出，与 ireader_welfare 口径一致）
+        acts = [(a.act, "命令行指定")] if a.act else []
+        if not acts:
+            try:
+                acts = tss_find_activities()
+            except Exception as e:
+                print(f"淘书市: 滚动栏拉取失败（{e}）", file=sys.stderr)
+        if not acts:
+            print("淘书市: 本期活动不在滚动栏里（未换期或已结束），"
+                  "可过几天再试，或用 ireader_welfare 领完券再来。")
+            return
+
+        act_id, source = acts[0]
+        if len(acts) > 1:
+            print(f"淘书市: 滚动栏挂了 {len(acts)} 期，取第一个 {act_id}（{source}）"
+                  f"，其余 {' '.join(x[0] for x in acts[1:])} 可用 --act 指定",
+                  file=sys.stderr)
+
+        try:
+            act = tss_load(act_id)
+        except Exception as e:
+            print(f"淘书市: 活动页解析失败（{e}）", file=sys.stderr)
+            sys.exit(1)
+        act["source"] = source
+        coupons = act["coupons"]
+        show_coupons = bool(getattr(a, "show_coupons", False))
+        if a.json and show_coupons:
+            print(json.dumps({"act_id": act_id, "source": source,
+                              "coupons": coupons}, ensure_ascii=False, indent=1))
+            return
+        print(f"淘书市: 活动 {act_id}（{source}）", file=sys.stderr)
+        if not coupons:
+            print("淘书市: 本期活动页里没有满减券组件，退化为纯书目推荐。", file=sys.stderr)
+        else:
+            print(f"淘书市: 本期 {len(coupons)} 张满减券：", file=sys.stderr)
+            for cp in coupons:
+                if cp.get("amount"):
+                    print(f"  {cp['amount']:>5.0f} 券  {cp['quota']}  {cp['valid']}",
+                          file=sys.stderr)
+            print("  （领券走 ireader_welfare：python src/main.py taoshushi）",
+                  file=sys.stderr)
+        if show_coupons:
+            for cp in coupons:
+                print(f"{cp['amount']:g}\t{cp['quota']}\t{cp['valid']}\t"
+                      f"#{cp['product_id']}")
+            return
+        if not act["book_ids"]:
+            print("淘书市: 本期活动页里没有书目组件。")
+            return
+
+        # ② 选一张「叠得上去」的券：门槛 ≤ 自付上限 + 面额。多张时取
+        #    面额最大者；够不上门槛则不启用（与 afford --coupon 同口径）。
+        limit = resolve_limit(a.limit)
+        coupon = None
+        ceiling = limit
+        if coupons:
+            usable = [v for v in coupons if v.get("amount")
+                      and (v.get("quota") and
+                           float(re.search(r"([\d.]+)", v["quota"]).group(1) or 0)
+                           or 0) <= limit + v["amount"]]
+            if usable:
+                coupon = max(usable, key=lambda v: v["amount"])
+                thr = float(re.search(r"([\d.]+)", coupon["quota"]).group(1) or 0)
+                coupon["threshold"] = thr
+                ceiling = limit + coupon["amount"]
+                print(f"选券「{coupon['amount']:g}券」{coupon['quota']} → "
+                      f"总价上限提到 {ceiling:.0f}（自付 ≤ {limit:.0f}）",
+                      file=sys.stderr)
+            else:
+                b = max(coupons, key=lambda v: v.get("amount") or 0)
+                print(f"满减券用不上：自付 {limit:.0f} + 面额 {b['amount']:g} = "
+                      f"{limit + (b['amount'] or 0):.0f}，够不到门槛 {b['quota']}。",
+                      file=sys.stderr)
+
+        # ③ 活动书目逐本查价（匿名可查；这里带着凭证是为了排除已拥有）
+        print(f"活动书目 {len(act['book_ids'])} 本，查价中…", file=sys.stderr)
+        cands = [{"id": bid} for bid in act["book_ids"]]
+        if a.top and len(cands) > a.top:
+            cands = cands[:a.top]
+        hits = c.filter_buyable(cands, ceiling, top=None)
+        order_map = {bid: i for i, bid in enumerate(act["book_ids"])}
+
+        # ④ 券后自付：价 ≥ 门槛才减面额；再按「自付 ≤ limit」收口。
+        def net_price(r: dict) -> float:
+            p = r.get("price") or 0
+            if coupon and p and p >= (coupon.get("threshold") or 0):
+                return max(p - coupon["amount"], 0)
+            return p
+
+        if coupon:
+            hits = [r for r in hits if net_price(r) <= limit]
+        hits.sort(key=lambda r: (net_price(r), order_map.get(r["id"], 10**9)))
+
+        # 未用券的书单独标出来（它们的价 ≤ limit 本身就买得起）
+        for r in hits:
+            r["coupon_used"] = bool(coupon and net_price(r) < (r.get("price") or 0))
+
+        enrich_douban(hits)
+
+        if a.json:
+            out = {"act_id": act_id, "source": source, "coupons": coupons,
+                   "limit": limit, "hits": hits}
+            if coupon:
+                out["coupon"] = coupon
+                out["ceiling"] = ceiling
+            print(json.dumps(out, ensure_ascii=False, indent=1))
+            return
+
+        head = (f"叠加「{coupon['amount']:g}券」后" if coupon else "")
+        print(f"\n=== 淘书市 {act_id} {head}自付 ≤ {limit:.0f} 阅饼："
+              f"{len(hits)} 本 ===\n")
+        for i, r in enumerate(hits[:40], 1):
+            line = fmt_book(i, r, real_vouchers(), show_intro)
+            if coupon and r["coupon_used"]:
+                line += (f"\n       券后自付 {net_price(r):.0f} 阅饼"
+                         f"（满{coupon['threshold']:.0f}减{coupon['amount']:g}）")
+            print(line)
+        if len(hits) > 40:
+            print(f"\n… 其余 {len(hits) - 40} 本省略（--json 可看全部）")
+        if not hits:
+            print("  本期书目没有「自付 ≤ 上限」的书。可 --limit 调高，"
+                  "或先去 ireader_welfare 领当期券。")
+        else:
+            print("\n说明：券后价按标价估算；满减券门槛比的是活动价，"
+                  "实际以 buy 试算为准。领券走 ireader_welfare（taoshushi）。")
+            douban_ask()
+        return
 
     # ---------------- afford ----------------
     if a.cmd == "afford":
